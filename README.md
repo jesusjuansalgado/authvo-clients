@@ -80,13 +80,30 @@ The AuthVO direction (from the IVOA DSP *Bearer Tokens — Open Issues* deck) is
 
 ## 4. Architecture of the harness
 
+```mermaid
+flowchart LR
+    client(["client"])
+    proxy["Traefik proxy<br/>:443"]
+    client -->|TLS| proxy
+
+    subgraph iamOrigin["iam.local.io — one TLS origin"]
+        iam["INDIGO IAM<br/>/token · /devicecode · /jwk · DCR"]
+        sidecar["prm-sidecar (nginx)<br/>/.well-known/oauth-protected-resource"]
+    end
+
+    subgraph srcOrigin["src.local.io"]
+        rs["resource server<br/>(the protected data)"]
+    end
+
+    proxy --> iam
+    proxy --> sidecar
+    proxy --> rs
 ```
-                         ┌─────────────────────── iam.local.io (one TLS origin) ──────────────────────┐
-   client ──TLS──▶ Traefik proxy ──▶ INDIGO IAM            (/, /token, /devicecode, /jwk, ...)
-                         │           └▶ prm-sidecar (nginx) (/.well-known/oauth-protected-resource)
-                         │
-                         └──▶ resource server               on  src.local.io   (the protected data)
-```
+
+> The shared box is the whole point: **IAM and the PRM sidecar answer on the same
+> `iam.local.io` origin**, so the client's domain-proxy check can tie the sidecar
+> back to the issuer. The resource server lives on a separate origin
+> (`src.local.io`); the same Traefik instance fronts all three on `:443`.
 
 * **IAM and the sidecar share the `iam.local.io` origin** — that co-location is
   the entire point of the domain-proxy check. Split them across hosts and the
