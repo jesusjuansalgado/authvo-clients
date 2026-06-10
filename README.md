@@ -72,7 +72,8 @@ The AuthVO direction (from the IVOA DSP *Bearer Tokens — Open Issues* deck) is
 | `test-integration/seed/seed.sh` | Registers a test client via RFC 7591 |
 | `test-integration/demo/demo.py` | Original reference driver (interactive device flow) |
 | `test-integration/demo/auto_demo.py` | Non-interactive driver (auto-approves the login) |
-| `test-integration/demo/human_demo.py` | Guided driver: explains and pauses on every step |
+| `test-integration/demo/human_demo.py` | Guided driver (Python): explains and pauses on every step |
+| `test-integration/demo/HumanDemo.java` | Guided driver (Java, JDK-only): same as human_demo.py |
 
 ---
 
@@ -401,6 +402,9 @@ python auto_demo.py --username vouser --password vouser
 # Guided — explains and pauses on every step; client self-registers (RFC 7591),
 # you log in and approve on the IAM's own page.
 python human_demo.py
+
+# Same guided flow in Java, no build step (JDK 11+):
+java HumanDemo.java
 ```
 
 On success the resource returns the protected payload (an ASCII galaxy in this
