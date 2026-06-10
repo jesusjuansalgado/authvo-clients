@@ -102,10 +102,15 @@ services:
       # PyJWKClient (pinned PyJWT 2.7.0) fetches the JWKS via urllib, which
       # ignores RS_CA_BUNDLE; point urllib's default TLS context at our CA too.
       SSL_CERT_FILE: "/certs/local-ca.pem"
+      # Read the payload from the mounted directory below. The app re-opens this
+      # file on every request, so edits to the art show up live.
+      RS_PAYLOAD_FILE: "/payload/protected_resource.txt"
     volumes:
       - ./certs/local-ca.pem:/certs/local-ca.pem:ro
-      # Mount the payload so editing it just needs a restart, not a rebuild.
-      - ./fake-rs/protected_resource.txt:/app/protected_resource.txt:ro
+      # Mount the WHOLE fake-rs dir (not the single file) at /payload. A directory
+      # bind-mount survives editors that replace the file on save (atomic write),
+      # so changing protected_resource.txt is picked up with no restart/rebuild.
+      - ./fake-rs:/payload:ro
     labels:
       - "traefik.enable=true"
       - "traefik.http.routers.rs.rule=Host(`src.local.io`)"
