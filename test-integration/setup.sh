@@ -1,22 +1,34 @@
 #!/usr/bin/env bash
 # One-shot bring-up for the AuthVO local integration harness.
+#
+# Generates TLS material + the IAM signing keystore, starts the stack, then
+# provisions the (otherwise empty) INDIGO IAM with a vo.read scope, login users
+# and the authvo-client. Re-running is safe.
 set -euo pipefail
 cd "$(dirname "$0")"
 
-mkdir -p certs traefik/dynamic
+mkdir -p certs traefik/dynamic iam/keys
 
 # --- 1. self-signed CA + a cert covering both local origins ----------------
+# NOTE: the extensions matter. OpenSSL 3 (used by Python 3.11+) rejects a CA
+# without basicConstraints/keyUsage ("CA cert does not include key usage
+# extension"), so both the CA and the leaf are issued WITH explicit extensions.
 if [ ! -f certs/local-ca.pem ]; then
   echo ">> generating a local CA and a *.local.io certificate"
   openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
     -keyout certs/local-ca.key -out certs/local-ca.pem \
-    -subj "/CN=AuthVO Local Test CA" >/dev/null 2>&1
+    -subj "/CN=AuthVO Local Test CA" \
+    -addext "basicConstraints=critical,CA:TRUE" \
+    -addext "keyUsage=critical,keyCertSign,cRLSign" >/dev/null 2>&1
 
   openssl req -nodes -newkey rsa:2048 \
     -keyout certs/local.key -out certs/local.csr \
     -subj "/CN=iam.local.io" >/dev/null 2>&1
 
   cat > certs/san.ext <<'EXT'
+basicConstraints = CA:FALSE
+keyUsage = digitalSignature, keyEncipherment
+extendedKeyUsage = serverAuth
 subjectAltName = DNS:iam.local.io, DNS:src.local.io
 EXT
 
@@ -39,7 +51,16 @@ tls:
         keyFile: /certs/local.key
 YML
 
-# --- 3. /etc/hosts reminder -------------------------------------------------
+# --- 3. IAM JWT signing key set --------------------------------------------
+# v1.10.0 ships no keystore and won't start without one. Generate a JWK set
+# (kid=rsa1) with the pure-JDK helper — no extra deps (JDK 11+ is already needed
+# for the Java client).
+if [ ! -f iam/keys/keystore.jwks ]; then
+  echo ">> generating the IAM signing keystore (iam/keys/keystore.jwks)"
+  java iam/GenKeystore.java iam/keys/keystore.jwks rsa1
+fi
+
+# --- 4. /etc/hosts reminder -------------------------------------------------
 if ! grep -q "iam.local.io" /etc/hosts 2>/dev/null; then
   echo ""
   echo ">> ACTION REQUIRED: add this line to /etc/hosts, then re-run:"
@@ -47,26 +68,24 @@ if ! grep -q "iam.local.io" /etc/hosts 2>/dev/null; then
   echo ""
 fi
 
-# --- 4. bring it up + seed --------------------------------------------------
+# --- 5. bring it up + provision --------------------------------------------
 echo ">> starting the stack"
 docker compose up -d --build
 
-echo ">> seeding the test client"
-RS_CA_BUNDLE="$(pwd)/certs/local-ca.pem" \
-IAM_ISSUER="https://iam.local.io/" \
-  bash seed/seed.sh
+echo ">> provisioning the IAM (scope + users + client)"
+bash seed/provision.sh
 
 cat <<'MSG'
 
-Ready. Close the demo with:
+Ready. Run a demo from the demo/ directory, e.g. the guided one:
 
-  python demo/demo.py \
-    --resource https://src.local.io/vo-resource \
-    --cacert  certs/local-ca.pem \
-    --client-id-file seed/client_id
+  cd demo && python human_demo.py          # client self-registers; you log in
+  # or the non-interactive driver:
+  python auto_demo.py --username vouser --password vouser
+  # or the preconfigured-client driver:
+  python demo.py --resource https://src.local.io/vo-resource \
+    --cacert ../certs/local-ca.pem --client-id-file ../seed/client_id
 
-You'll be shown a URL + code to log in (device grant); on approval the client
-exchanges the token down to aud=https://src.local.io and prints:
-
-  protected resource data
+Log in (device grant) as  vouser / vouser  (or admin / password); on approval
+the resource returns the protected payload.
 MSG

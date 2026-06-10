@@ -63,13 +63,14 @@ The AuthVO direction (from the IVOA DSP *Bearer Tokens — Open Issues* deck) is
 | `pom.xml` | Java build |
 | `test-integration/` | The runnable Docker harness (everything below lives here) |
 | `test-integration/docker-compose.yml` | The whole stack behind Traefik |
-| `test-integration/setup.sh` | Generates certs + Traefik config, brings it up, seeds |
+| `test-integration/setup.sh` | One-shot: certs + keystore + Traefik config, brings it up, provisions |
 | `test-integration/iam/iam.env` | INDIGO IAM configuration |
-| `test-integration/iam/keys/keystore.jwks` | JWT signing key set (see §7) |
+| `test-integration/iam/GenKeystore.java` | Generates the IAM JWK signing keystore (pure JDK) |
+| `test-integration/iam/keys/keystore.jwks` | JWT signing key set, generated locally (see §7) |
 | `test-integration/sidecar/prm.json` + `nginx.conf` | The PRM sidecar (see §6) |
 | `test-integration/traefik/traefik.yml` | Single-origin proxy + TLS |
 | `test-integration/fake-rs/` | The protected resource server (Flask) |
-| `test-integration/seed/seed.sh` | Registers a test client via RFC 7591 |
+| `test-integration/seed/provision.sh` | Provisions the IAM: vo.read scope, login users, authvo-client |
 | `test-integration/demo/demo.py` | Original reference driver (interactive device flow) |
 | `test-integration/demo/auto_demo.py` | Non-interactive driver (auto-approves the login) |
 | `test-integration/demo/human_demo.py` | Guided driver (Python): explains and pauses on every step |
@@ -280,8 +281,10 @@ volumes:
 ### 7.3 Provision the empty database
 
 Under the `mysql` profile the schema is created but **no seed data** is loaded —
-no users, no clients, the custom `vo.read` scope does not exist. Provision the
-following (the harness does this directly against the `db` container).
+no users, no clients, the custom `vo.read` scope does not exist. `setup.sh` runs
+[`seed/provision.sh`](test-integration/seed/provision.sh) to do all of this
+automatically (idempotently); the SQL below is what that script does, for
+reference.
 
 **a) A login user** (the device grant needs a real account). INDIGO stores a
 bcrypt password and uses a `DTYPE='IamUserInfo'` discriminator on `iam_user_info`:
@@ -386,8 +389,14 @@ Two harness fixes worth noting:
 
 ```bash
 cd test-integration
-./setup.sh            # certs + Traefik config + docker compose up + seed
+./setup.sh            # certs + keystore + Traefik config + up + provision (idempotent)
 ```
+
+`setup.sh` reproduces the whole working stack in one shot: it generates the CA/leaf
+certs (with the X.509 extensions OpenSSL 3 requires, §8) and the IAM signing
+keystore (§7.2), starts the stack, then runs `seed/provision.sh` to create the
+`vo.read` scope, the login users (`admin`/`password`, `vouser`/`vouser`) and the
+`authvo-client` (§7.3). It is safe to re-run.
 
 Then run any of the three drivers from `test-integration/demo/`:
 
