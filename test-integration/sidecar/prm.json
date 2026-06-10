@@ -1,0 +1,13 @@
+{
+  "resource": "https://src.local.io",
+  "authorization_servers": [
+    "https://iam.local.io/"
+  ],
+  "scopes_supported": [
+    "vo.read"
+  ],
+  "bearer_methods_supported": [
+    "header"
+  ],
+  "resource_documentation": "https://www.ivoa.net/documents/authvo/"
+}
