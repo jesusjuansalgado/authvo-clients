@@ -14,8 +14,8 @@ Two groups:
   * the RFC 9728 Protected Resource Metadata endpoint (PRM URL derivation per
     section 3.1, document contents per section 2).
 """
+import importlib.util
 import os
-import sys
 import time
 import unittest
 from pathlib import Path
@@ -34,8 +34,11 @@ os.environ.update({
     "RS_PAYLOAD_FILE": str(RS_DIR / "protected_resource.txt"),
 })
 os.environ.pop("RS_PRM_URL", None)
-sys.path.insert(0, str(RS_DIR))
-import app as rs  # noqa: E402  (import after the environment is set)
+# Load by path under a unique name: augmenter/app.py is also called "app", and
+# the two test modules may share one interpreter.
+_spec = importlib.util.spec_from_file_location("fake_rs_app", RS_DIR / "app.py")
+rs = importlib.util.module_from_spec(_spec)
+_spec.loader.exec_module(rs)
 
 RESOURCE = "https://src.local.io"
 ISSUER = "https://iam.local.io/"
