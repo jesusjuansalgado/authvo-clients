@@ -1,57 +1,38 @@
 # AuthVO local integration harness
 
 A self-contained, `docker compose`–based environment for exercising the AuthVO
-bearer-token flow end to end, with **INDIGO IAM** as the authorization server
-and a **protected-resources "sidecar" that is just the RFC 9728 JSON document**.
-It implements the unified proposal from the *Bearer Tokens in AuthVO — Open
-Issues* deck (the PRM-discovery + token-exchange flow, slides 13–22).
+bearer-token flow end to end, with **INDIGO IAM** as the authorization server. It
+implements the RFC 9728-conformant flow agreed after
+[AuthVO issue #22](https://github.com/ivoa-std/AuthVO/issues/22): the **resource
+server publishes its own Protected Resource Metadata (PRM)**, and the client
+confirms the binding from the **issuer's own RFC 8414 metadata**, whose
+`protected_resources` member must list the resource.
 
 It closes with a real protected REST service that requires a token scoped
-`vo.read` and hands back the ASCII file `protected resource data`.
+`vo.read` and hands back the ASCII file `protected resource data`, and an "evil"
+resource server for a negative test. The top-level [README](../README.md) has the
+full explanation; this page is the quick tour.
 
 ## What's in the box
 
 | Component | Role | Lives at |
 |-----------|------|----------|
-| `iam` (INDIGO IAM + db, redis, trustanchors) | Authorization server: device grant, DCR, token exchange, audience-bound JWTs | `https://iam.local.io/` |
-| `prm-sidecar` (nginx + `sidecar/prm.json`) | The **sidecar** — one RFC 9728 Protected Resource Metadata document, nothing more | `https://iam.local.io/.well-known/oauth-protected-resource` |
-| `proxy` (Traefik) | Puts IAM **and** sidecar on **one origin** so the client's domain-proxy check is meaningful | `:443` |
-| `resource` (`fake-rs/`) | The protected REST interface — the demo closer | `https://src.local.io/` |
-| `seed/seed.sh` | Registers a test client (device + token-exchange, `vo.read`) via RFC 7591 | — |
-| `demo/demo.py` | Reference client (Python) that walks the whole flow; swap for the Python `authvo-client` | — |
-| `demo/Demo.java` | Same flow in Java (JDK 11+, no build step) — for the Java client | — |
-
-## Why the sidecar sits at the IAM origin
-
-This is the security crux from slide 5 and slide 14. The resource server's
-`401` returns **only a pointer** (`resource_metadata=...`) — it never serves the
-authoritative descriptor. The client honours that pointer only after the
-**domain-proxy check**: the sidecar and the issuer must share an origin, and the
-resource being accessed must be the one the descriptor covers. Co-locating IAM
-and sidecar behind one Traefik origin (`iam.local.io`) is exactly what makes a
-spoofed `evil.com` descriptor fail that check. Run them on separate hosts and
-the check becomes vacuous — so the harness deliberately shares the origin.
-
-## The protected REST service (`fake-rs/app.py`)
-
-- Unauthenticated `GET /vo-resource` (or a dynamic `GET /datalink/download/...`
-  deep link) → `401` with `WWW-Authenticate: Bearer resource_metadata="<PRM>"`.
-- With a Bearer token it checks, before returning anything:
-  signature against the IAM JWKS, `iss` == IAM, **`aud` == its own resource id**,
-  scope contains **`vo.read`**, not expired.
-- Valid → `200` with the ASCII body `protected resource data`.
-- Missing scope → `403 insufficient_scope`. Bad/expired/wrong-aud → `401`.
-
-The validation logic ships verified against six cases (valid, wrong-aud,
-missing-scope, rogue-issuer, expired, unauthenticated).
+| `iam` (INDIGO IAM + db, redis, trustanchors) | Authorization server: device grant, DCR, JWTs | `https://iam.local.io/` |
+| `augmenter` (`augmenter/`) | Adds `protected_resources` to the IAM's two `/.well-known` metadata documents. **Interim emulation** — delete it once INDIGO publishes the member | `https://iam.local.io/.well-known/oauth-authorization-server` and `/openid-configuration` |
+| `proxy` (Traefik) | TLS front door for all three origins; sends exactly the two metadata paths to the augmenter (priority 100), the rest of `iam.local.io` to the IAM | `:443` |
+| `resource` (`fake-rs/`) | The protected REST interface; serves its **own** RFC 9728 PRM | `https://src.local.io/` |
+| `evil` (`fake-rs/`, 2nd instance) | A resource server whose PRM names the real IAM but which the IAM does not list — every client must refuse it | `https://evil.local.io/` |
+| `seed/provision.sh` | Provisions the IAM: `vo.read` scope, login users, the `authvo-client` | — |
+| `demo/` | Reference, non-interactive and guided drivers (Python and Java) | — |
+| `tests/` | Offline unit tests and the live scenario runner | — |
 
 ## Run it
 
 ```bash
-# one-time: map the hostnames locally
-echo "127.0.0.1  iam.local.io src.local.io" | sudo tee -a /etc/hosts
+# one-time: map the hostnames locally (evil.local.io is only for the negative test)
+echo "127.0.0.1  iam.local.io src.local.io evil.local.io" | sudo tee -a /etc/hosts
 
-./setup.sh           # generates *.local.io certs, brings the stack up, seeds the client
+./setup.sh           # certs (leaf re-issued if it lacks a name), keystore, up, provision
 
 python demo/demo.py \
   --resource https://src.local.io/vo-resource \
@@ -59,14 +40,17 @@ python demo/demo.py \
   --client-id-file seed/client_id
 ```
 
-The demo prints the device-flow URL + code; log in and approve, and it exchanges
-the token down to `aud=https://src.local.io`, calls the resource, and prints
-`protected resource data`.
+The demo prints the device-flow URL + code; log in and approve, and it prints
+`protected resource data`. Everything is covered in the top-level README, §10
+(drivers, the reference clients, offline tests, the live scenarios):
+
+```bash
+python tests/run_scenarios.py --java-cp "$JACKSON"      # real clients vs. the live stack
+```
 
 ### Running the Java client instead
 
-Everything in the harness is Python/shell except `demo/Demo.java`, which exists
-because one of the two clients is in Java. It needs no build step on JDK 11+:
+`demo/Demo.java` and `demo/HumanDemo.java` need no build step on JDK 11+:
 
 ```bash
 java demo/Demo.java \
@@ -75,12 +59,36 @@ java demo/Demo.java \
   --client-id-file seed/client_id
 ```
 
-Both `demo.py` and `Demo.java` are reference drivers that reimplement the flow
-so the harness runs standalone. Replace the `[6]`–`[9]` section of each with
-calls into your real client: `demo.py` → the Python `authvo-client`, `Demo.java`
-→ the Java one. The harness contract (the 401 pointer, the PRM, the
-domain-proxy check, token exchange, `aud`/`vo.read` enforcement) is identical
-for both, so the two clients are exercised against exactly the same stack.
+The demos are standalone reference drivers that reimplement the flow so the
+harness runs on its own (the checks they share are in `demo/authvo_checks.py`).
+The real clients are `authvo_client.py` and `AuthVoClient.java` at the repo root;
+the scenario runner exercises those.
+
+## Why the resource check, not a shared origin
+
+The old design hosted the PRM on the IAM origin and had the client require the
+sidecar and the issuer to share an origin. RFC 9728 puts the PRM at the resource
+server — but then the resource server can claim *any* issuer, including the real
+IAM, to lure the user into obtaining a real token for it. So the client asks the
+other side: the issuer's own RFC 8414 metadata must (a) carry the issuer the PRM
+named and (b) list the resource in `protected_resources` (absent list = abort),
+all before the user logs in. Co-locating anything is no longer part of the
+argument. See the top-level README §1–§2 and §13.
+
+## The protected REST service (`fake-rs/app.py`)
+
+- Unauthenticated `GET /vo-resource` (or a dynamic `GET /datalink/download/...`
+  deep link) → `401` with `WWW-Authenticate: Bearer resource_metadata="<its PRM>"`.
+- `GET /.well-known/oauth-protected-resource` → its PRM, built from its
+  environment (`RS_RESOURCE_ID`, `RS_ISSUER`, `RS_REQUIRED_SCOPE`).
+- With a Bearer token it checks, before returning anything: signature against the
+  IAM JWKS, `iss` == IAM, scope contains **`vo.read`**, not expired, and — **if
+  the token carries an `aud`** — that it includes its own resource id.
+- Valid → `200` with the ASCII body. Missing scope → `403 insufficient_scope`.
+  Bad/expired/wrong-aud → `401`.
+
+The validation is covered by `tests/test_fake_rs.py` (valid, wrong aud, missing
+scope, rogue issuer, expired, unauthenticated; plus the PRM and `aud` present/absent).
 
 ## INDIGO IAM caveats (worth reading before you commit)
 
@@ -88,17 +96,16 @@ for both, so the two clients are exercised against exactly the same stack.
   releases; `iam/iam.env` mirrors the upstream compose shape but check the
   configuration reference for the tag you pin in `docker-compose.yml`.
 - **JWT signing key.** The resource server verifies a JWT against the IAM JWKS,
-  so the IAM must issue JWT access tokens (mount a signing keystore or use the
-  dev image's generated key).
-- **A login user** must exist for the device grant (IAM admin, or the dev
-  image's default test user).
-- **Resource indicators / RFC 9728 are partial in INDIGO today** (deck slide 11)
-  — which is fine: the harness serves the PRM itself and relies on token
-  exchange (8693, supported) to mint the `aud`-bound token. If your IAM
-  restricts audiences, register `https://src.local.io` as an allowed audience.
+  so the IAM must issue JWT access tokens (mount a signing keystore).
+- **A login user** must exist for the device grant (`provision.sh` creates one).
+- **`protected_resources` is not published by INDIGO today**, hence the augmenter.
+  Resource indicators (RFC 8707) are partial too: the clients send `resource`, and
+  the resource server checks `aud` only when the token carries one.
+- Token exchange (RFC 8693) is optional and off by default; a self-registered
+  client can't use it on INDIGO (see the top-level README §7.4).
 
 ## CI note
 
-The device grant needs a human. For non-interactive CI, register a confidential
-client and use a direct grant (e.g. password) to get the broad token, then run
-steps 8–9 unchanged.
+The device grant needs a human. The scenario runner and `demo/auto_demo.py`
+auto-approve it by logging in as `vouser` on the IAM's own pages. For other
+non-interactive set-ups, register a confidential client and use a direct grant.

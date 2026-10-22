@@ -121,4 +121,10 @@ Ready. Run a demo from the demo/ directory, e.g. the guided one:
 
 Log in (device grant) as  vouser / vouser  (or admin / password); on approval
 the resource returns the protected payload.
+
+To run the real clients through every scenario (happy path, the evil resource
+server, a missing protected_resources list, a PRM that does not cover the URL, a
+redirect on the PRM):
+
+  python tests/run_scenarios.py --java-cp "$JACKSON"   # Jackson jars for the Java client
 MSG
