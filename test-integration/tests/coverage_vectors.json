@@ -1,0 +1,32 @@
+{
+  "_comment": "Shared by the Python and Java clients' tests so the two cannot drift. 'covered' = is_covered(url, resource_id); 'most_specific' = most_specific_cover(url, ids).",
+  "covered": [
+    ["https://src.local.io/vo/tap/async/1", "https://src.local.io/vo", true],
+    ["https://src.local.io/vo",              "https://src.local.io/vo", true],
+    ["https://src.local.io/vo/",             "https://src.local.io/vo", true],
+    ["https://src.local.io/vo",              "https://src.local.io/vo/", true],
+    ["https://src.local.io/vocab",           "https://src.local.io/vo", false],
+    ["https://src.local.io/anything/at/all", "https://src.local.io", true],
+    ["https://src.local.io/",                "https://src.local.io", true],
+    ["https://src.local.io",                 "https://src.local.io/", true],
+    ["https://src.local.io:443/vo",          "https://src.local.io/vo", true],
+    ["https://SRC.local.io/vo",              "https://src.local.io/vo", true],
+    ["https://src.local.io:8443/vo",         "https://src.local.io/vo", false],
+    ["http://src.local.io/vo",               "https://src.local.io/vo", false],
+    ["https://evil.local.io/vo",             "https://src.local.io", false],
+    ["https://src.local.io.evil.com/vo",     "https://src.local.io", false],
+    ["https://src.local.io@evil.local.io/vo", "https://src.local.io", false],
+    ["https://src.local.io/vo/../other",     "https://src.local.io/vo", false],
+    ["https://src.local.io/vo/%2e%2e/other", "https://src.local.io/vo", false],
+    ["https://src.local.io/other/../vo/x",   "https://src.local.io/vo", true],
+    ["https://src.local.io/vo?x=1#frag",     "https://src.local.io/vo", true],
+    ["https://src.local.io/VO",              "https://src.local.io/vo", false]
+  ],
+  "most_specific": [
+    ["https://src.local.io/vo/tap", ["https://src.local.io", "https://src.local.io/vo"], "https://src.local.io/vo"],
+    ["https://src.local.io/vo/tap", ["https://src.local.io/vo", "https://src.local.io"], "https://src.local.io/vo"],
+    ["https://src.local.io/other",  ["https://src.local.io", "https://src.local.io/vo"], "https://src.local.io"],
+    ["https://src.local.io/other",  ["https://src.local.io/vo"], null],
+    ["https://src.local.io/vo",     [], null]
+  ]
+}
