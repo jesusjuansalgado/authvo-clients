@@ -52,6 +52,12 @@ public class DemoHelpersTest {
         eq("asMetadataUrls path", "https://h/.well-known/oauth-authorization-server/iam", HumanDemo.asMetadataUrls("https://h/iam")[0]);
         eq("audOf absent", "<absent/opaque>", Demo.audOf("opaque"));
 
+        // The IAM escapes '=' as \\u003d and '/' as \\/ ; the printed URL must be usable.
+        String esc = "{\"verification_uri_complete\":\"https:\\/\\/iam.local.io\\/device?user_code\\u003dAB_12\"}";
+        eq("Demo.jsonStr unescapes \\u003d and \\/", "https://iam.local.io/device?user_code=AB_12", Demo.jsonStr(esc, "verification_uri_complete"));
+        eq("HumanDemo.jsonStr unescapes \\u003d and \\/", "https://iam.local.io/device?user_code=AB_12", HumanDemo.jsonStr(esc, "verification_uri_complete"));
+        eq("jsonStrArray unescapes", List.of("https://x.example/a"), Demo.jsonStrArray("{\"k\":[\"https:\\/\\/x.example\\/a\"]}", "k"));
+
         System.out.println((ran - failures) + "/" + ran + " passed");
         System.exit(failures == 0 ? 0 : 1);
     }

@@ -475,7 +475,36 @@ public class HumanDemo {
     }
 
     static String jsonStr(String json, String key) {
-        return group(json, "\"" + Pattern.quote(key) + "\"\\s*:\\s*\"([^\"]*)\"");
+        return jsonUnescape(group(json, "\"" + Pattern.quote(key) + "\"\\s*:\\s*\"([^\"]*)\""));
+    }
+
+    /**
+     * Decode the JSON string escapes (slash, quote, backslash, n/t/r/b/f and the
+     * four-hex-digit unicode form) in a value read by the regex JSON helpers. The IAM
+     * escapes '=' in unicode form, so without this the printed verification URL would
+     * contain a literal backslash-u003d where a human needs '=' and could not open it.
+     */
+    static String jsonUnescape(String s) {
+        if (s == null || s.indexOf('\\') < 0) return s;
+        StringBuilder b = new StringBuilder();
+        for (int i = 0; i < s.length(); i++) {
+            char c = s.charAt(i);
+            if (c != '\\' || i + 1 >= s.length()) { b.append(c); continue; }
+            char n = s.charAt(++i);
+            switch (n) {
+                case 'u':
+                    if (i + 4 < s.length()) { b.append((char) Integer.parseInt(s.substring(i + 1, i + 5), 16)); i += 4; }
+                    else b.append(n);
+                    break;
+                case 'n': b.append('\n'); break;
+                case 't': b.append('\t'); break;
+                case 'r': b.append('\r'); break;
+                case 'b': b.append('\b'); break;
+                case 'f': b.append('\f'); break;
+                default:  b.append(n);               // \/  \"  \\
+            }
+        }
+        return b.toString();
     }
 
     static long jsonNum(String json, String key, long dflt) {
@@ -493,7 +522,7 @@ public class HumanDemo {
         if (!m.find()) return null;
         List<String> out = new ArrayList<>();
         Matcher e = Pattern.compile("\"([^\"]*)\"").matcher(m.group(1));
-        while (e.find()) out.add(e.group(1));
+        while (e.find()) out.add(jsonUnescape(e.group(1)));
         return out;
     }
 
