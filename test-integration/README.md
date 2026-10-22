@@ -99,8 +99,10 @@ scope, rogue issuer, expired, unauthenticated; plus the PRM and `aud` present/ab
   so the IAM must issue JWT access tokens (mount a signing keystore).
 - **A login user** must exist for the device grant (`provision.sh` creates one).
 - **`protected_resources` is not published by INDIGO today**, hence the augmenter.
-  Resource indicators (RFC 8707) are partial too: the clients send `resource`, and
-  the resource server checks `aud` only when the token carries one.
+  Resource indicators (RFC 8707) are not honoured either: v1.10.0 accepts the
+  `resource` parameter the clients send but ignores it, so the token has no `aud`
+  (the resource server checks `aud` only when the token carries one). The optional
+  token exchange is what yields an `aud`-bound token.
 - Token exchange (RFC 8693) is optional and off by default; a self-registered
   client can't use it on INDIGO (see the top-level README §7.4).
 

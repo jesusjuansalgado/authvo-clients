@@ -19,7 +19,8 @@ Prerequisites
 
 Scenarios
   0  preflight: the stack serves what the flow relies on
-  1  happy path (preconfigured client), then 1b with dynamic registration
+  1  happy path (preconfigured client), 1b with dynamic registration, 1c with the
+     optional RFC 8693 token exchange switched on
   2  evil resource server (evil.local.io): abort at the resource check
   3  `protected_resources` removed from the augmenter config: abort at the check
   4  PRM `resource` does not cover the requested URL: abort at step 2
@@ -95,9 +96,9 @@ class Client:
     def __init__(self, name, argv_for, env):
         self.name, self.argv_for, self.env = name, argv_for, env
 
-    def run(self, url, *, approve, creds, client_id, timeout=240):
+    def run(self, url, *, approve, creds, client_id, timeout=240, env_extra=None):
         """Run the client; auto-approve the device login if it asks. -> (rc, output)."""
-        env = dict(os.environ, **self.env)
+        env = dict(os.environ, **self.env, **(env_extra or {}))
         env.pop("AUTHVO_CLIENT_ID", None)
         if client_id:
             env["AUTHVO_CLIENT_ID"] = client_id
@@ -187,6 +188,15 @@ def expect_success(scenario, client, rc, out):
            else f"expected success (rc=0, payload); got rc={rc}")
 
 
+def expect_exchange(scenario, client, rc, out):
+    """Success, AND the optional RFC 8693 exchange ran and produced an aud-bound token."""
+    marker = [l.strip() for l in PAYLOAD.read_text().splitlines() if l.strip()][-1]
+    ok = (rc == 0 and "STEP 5d" in out and marker in out
+          and f"exchanged token aud={SRC}" in out)
+    record(scenario, client, ok, "token exchange ran; exchanged token aud=" + SRC if ok
+           else f"expected an exchanged, aud-bound token and the payload; got rc={rc}")
+
+
 def expect_abort(scenario, client, rc, out, must_contain):
     problems = []
     if rc != 1:
@@ -251,10 +261,10 @@ def s0_preflight(args):
     return ok
 
 
-def run_each(clients, scenario, url, *, approve, creds, client_id, check):
+def run_each(clients, scenario, url, *, approve, creds, client_id, check, env_extra=None):
     for c in clients:
         print(f"{BOLD}--- {c.name} client{RESET}")
-        rc, out = c.run(url, approve=approve, creds=creds, client_id=client_id)
+        rc, out = c.run(url, approve=approve, creds=creds, client_id=client_id, env_extra=env_extra)
         check(scenario, c.name, rc, out)
 
 
@@ -265,6 +275,11 @@ def s1_happy(args, clients, creds, cid):
     header("Scenario 1b - happy path with dynamic client registration (no preconfigured client_id)")
     run_each(clients, "1b", SRC + "/vo-resource", approve=True, creds=creds, client_id=None,
              check=expect_success)
+    header("Scenario 1c - OPTIONAL token exchange switched on (AUTHVO_TOKEN_EXCHANGE=1): aud-bound token")
+    print(f"{DIM}INDIGO 1.10 ignores the `resource` indicator (no aud in the token above); the exchange is how "
+          f"an aud-bound token is obtained.{RESET}")
+    run_each(clients, "1c", SRC + "/vo-resource", approve=True, creds=creds, client_id=cid,
+             check=expect_exchange, env_extra={"AUTHVO_TOKEN_EXCHANGE": "1"})
 
 
 def s2_evil(args, clients, creds, cid):

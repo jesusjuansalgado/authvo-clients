@@ -383,7 +383,17 @@ the device-grant token request, and stop there: RFC 8693 token exchange is
 that comes back carries an `aud` is up to the issuer — which is why the resource
 server enforces `aud` **whenever the token has one** (it must include the
 resource) without *requiring* one; the signature, `iss`, `vo.read` and expiry are
-always checked. Clients log the token's `aud` for information only and never fail
+always checked.
+
+> **Observed with the pinned INDIGO IAM v1.10.0:** it *accepts* the `resource`
+> parameter but **ignores it** — the access token has no `aud` (the clients log
+> `aud=<absent>`). So against INDIGO the flow works, but the token is not
+> audience-bound unless the **optional token exchange** is used: with it on
+> (scenario 1c in §10) the exchanged token carries `aud=https://src.local.io`.
+> Without an `aud` the resource server cannot tell a token minted for it from one
+> minted for another service this issuer serves, so deployments that want replay
+> protection against INDIGO should enable the exchange (or an issuer that honours
+> RFC 8707). Clients log the token's `aud` for information only and never fail
 on it. (Earlier versions of `human_demo` used INDIGO's non-standard `aud` request
 parameter; that is gone — the clients send `resource` only.)
 
@@ -537,7 +547,7 @@ python test-integration/tests/run_scenarios.py --java-cp "$JACKSON"
 | # | Scenario | Expected |
 |---|----------|----------|
 | 0 | preflight | the stack serves the PRM, the augmented metadata, no PRM sidecar |
-| 1 | happy path (preconfigured client, then dynamic registration), Python and Java | protected payload returned |
+| 1 | happy path (1: preconfigured client, 1b: dynamic registration, 1c: with the optional token exchange on), Python and Java | protected payload returned (1c: the exchanged token carries `aud`) |
 | 2 | evil resource server (`evil.local.io`) | abort at the resource check, before any login |
 | 3 | `protected_resources` removed from the augmenter config | abort at the resource check |
 | 4 | PRM `resource` does not cover the requested URL | abort at step 2 |

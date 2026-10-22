@@ -587,6 +587,9 @@ class AuthVoClient:
         if "user_code" not in (device.get("verification_uri_complete") or ""):
             print("  Enter code          : %s" % device.get("user_code", ""))
         print("=" * 64 + "\n")
+        # The user (or a wrapping script) must see this NOW, even when stdout is a
+        # pipe and therefore block-buffered: the flow cannot continue without it.
+        sys.stdout.flush()
         if self.open_browser:
             try:
                 webbrowser.open(uri)
