@@ -33,7 +33,8 @@ AuthVO closes that hole with two independent checks, both implemented below:
 Once both hold, the user logs in (device grant) and the token request carries the
 matched resource as an RFC 8707 `resource` indicator, so a cooperating issuer
 can bind the token's audience to it. (Optionally the token can be narrowed
-further by RFC 8693 token exchange -- off by default.)
+further by RFC 8693 token exchange -- OFF by default, enable it with
+AuthVoClient(token_exchange=True) or AUTHVO_TOKEN_EXCHANGE=1.)
 
 THE FLOW, STEP BY STEP (numbers match the methods below)
 --------------------------------------------------------
@@ -49,7 +50,8 @@ THE FLOW, STEP BY STEP (numbers match the methods below)
   4  Client registration: preconfigured client_id, else RFC 7591 DCR.
   5  Token: device authorization (RFC 8628) -> the user logs in and approves
      (we show the resource AND the issuer) -> poll the token endpoint, sending
-     resource=<matched resource id> (RFC 8707). Optional RFC 8693 exchange.
+     resource=<matched resource id> (RFC 8707). Optional RFC 8693 exchange
+     (off by default).
   6  Present the token to the resource; the RS validates signature, iss, scope,
      expiry, and aud when present.
   7  (refresh would re-send the same `resource`; not implemented here)
@@ -289,12 +291,14 @@ class AuthVoClient:
                  exchange_scope: str = "vo.read",
                  timeout: int = 30,
                  open_browser: bool = False,
-                 token_exchange: bool = True) -> None:
+                 token_exchange: bool = False) -> None:
         # `scope`          : requested at the device grant (step 5).
         # `client_id`      : if given, we skip dynamic registration (step 4).
         # `exchange_scope` : scope asked for on an exchanged token (step 5d).
         # `open_browser`   : auto-open the verification URL for the user (step 5b).
         # `token_exchange` : also run the RFC 8693 narrowing exchange (step 5d).
+        #                    OFF by default: the `resource` indicator on the token
+        #                    request (RFC 8707) is the primary audience mechanism.
         self.scope = scope
         self.client_id = client_id
         self.exchange_scope = exchange_scope
@@ -756,8 +760,8 @@ def main(argv: list[str]) -> int:
       AUTHVO_RESOURCE        the protected-resource URL (if not passed as argv[1])
       AUTHVO_CLIENT_ID       a preconfigured client_id (skips dynamic registration)
       AUTHVO_OPEN_BROWSER    "1" to auto-open the device verification URL
-      AUTHVO_TOKEN_EXCHANGE  "0" to skip the RFC 8693 exchange (the default will
-                             become "off"; see the token-exchange commit)
+      AUTHVO_TOKEN_EXCHANGE  "1" to ALSO run the RFC 8693 token exchange (off by
+                             default; needs a client the IAM lets use that grant)
     """
     # Log as plain lines so the STEP trace reads as a clean narrative.
     logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -770,7 +774,7 @@ def main(argv: list[str]) -> int:
     client = AuthVoClient(
         client_id=os.environ.get("AUTHVO_CLIENT_ID"),
         open_browser=os.environ.get("AUTHVO_OPEN_BROWSER") == "1",
-        token_exchange=os.environ.get("AUTHVO_TOKEN_EXCHANGE", "1") != "0",
+        token_exchange=os.environ.get("AUTHVO_TOKEN_EXCHANGE") == "1",
     )
     try:
         resp = client.access(resource)

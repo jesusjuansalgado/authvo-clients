@@ -8,6 +8,7 @@ Two groups:
 
   * the six token-validation cases the harness has always promised -- valid,
     wrong audience, missing vo.read, rogue issuer, expired, unauthenticated --
+    (plus: `aud` is checked when present but no longer required) --
     exercised both on the pure validate_token() helper and through the HTTP
     route (so the status codes and WWW-Authenticate headers are checked too);
 
@@ -87,6 +88,23 @@ class ValidateToken(unittest.TestCase):
         with self.assertRaises(PermissionError):
             rs.validate_token(make_token(scope="openid"), _PUB)
 
+    # aud is checked when present, not required (token exchange is optional now)
+    def test_no_aud_claim_is_accepted(self):
+        claims = rs.validate_token(make_token(aud=None), _PUB)
+        self.assertNotIn("aud", claims)
+
+    def test_aud_list_including_us_is_accepted(self):
+        rs.validate_token(make_token(aud=["https://other.example", RESOURCE]), _PUB)
+
+    def test_aud_list_without_us_is_refused(self):
+        with self.assertRaises(jwt.InvalidAudienceError):
+            rs.validate_token(make_token(aud=["https://other.example"]), _PUB)
+
+    def test_empty_aud_is_refused(self):
+        # present-but-empty is not "absent": it names nobody, so it is not for us
+        with self.assertRaises(jwt.InvalidAudienceError):
+            rs.validate_token(make_token(aud=[]), _PUB)
+
     def test_rogue_issuer(self):
         with self.assertRaises(jwt.InvalidIssuerError):
             rs.validate_token(make_token(iss="https://evil.example/"), _PUB)
@@ -118,6 +136,9 @@ class Routes(unittest.TestCase):
         r = self.get(make_token())
         self.assertEqual(r.status_code, 200)
         self.assertTrue(r.data)
+
+    def test_token_without_aud_gets_payload(self):
+        self.assertEqual(self.get(make_token(aud=None)).status_code, 200)
 
     def test_wrong_audience_is_401(self):
         self.assertEqual(self.get(make_token(aud="https://other.example")).status_code, 401)

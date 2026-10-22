@@ -250,6 +250,43 @@ class Step3ResourceCheck(unittest.TestCase):
         self.assertAborts(good_routes(), "HTTPS", "http://iam.local.io/")
 
 
+class TokenExchangeOptional(unittest.TestCase):
+    """Token exchange (RFC 8693) is opt-in; DCR only asks for grants it will use."""
+
+    META = ac.ASMetadata(issuer=ISSUER, token_endpoint="https://iam.local.io/token",
+                         device_authorization_endpoint="https://iam.local.io/devicecode",
+                         registration_endpoint="https://iam.local.io/register")
+
+    class Recorder:
+        """Records the registration POST and answers it."""
+        headers = {}
+
+        def __init__(self):
+            self.body = None
+
+        def post(self, url, json=None, **kw):
+            self.body = json
+            return FakeResponse(201, {"client_id": "dyn-1"})
+
+    def register(self, **kw):
+        c = ac.AuthVoClient(**kw)            # no client_id -> must register
+        c.http = self.Recorder()
+        self.assertEqual(c._step4_register(self.META), "dyn-1")
+        return c.http.body
+
+    def test_off_by_default(self):
+        self.assertFalse(ac.AuthVoClient().token_exchange)
+
+    def test_dcr_requests_only_the_device_grant_by_default(self):
+        body = self.register()
+        self.assertEqual(body["grant_types"], [ac.GRANT_DEVICE_CODE])
+        self.assertEqual(body["scope"], "openid vo.read")
+
+    def test_dcr_adds_the_exchange_grant_only_when_enabled(self):
+        body = self.register(token_exchange=True)
+        self.assertEqual(body["grant_types"], [ac.GRANT_DEVICE_CODE, ac.GRANT_TOKEN_EXCHANGE])
+
+
 class MetadataUrls(unittest.TestCase):
     def test_issuer_with_and_without_path(self):
         f = ac.AuthVoClient._as_metadata_urls

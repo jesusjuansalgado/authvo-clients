@@ -18,7 +18,11 @@ Implements the bearer mechanism from the AuthVO "Security Challenges" talk:
   - Authenticated request -> the access token is validated and must:
         * be a JWT signed by the IAM (signature checked against IAM JWKS),
         * have `iss` == the configured IAM issuer,
-        * have `aud` == this resource's own id  (RS verifies aud, slide 21/11),
+        * if it carries an `aud`, that must include this resource's own id.
+          `aud` is checked WHEN PRESENT but not required: a token requested with
+          the RFC 8707 `resource` indicator may come back without one if the
+          issuer does not bind audiences (INDIGO IAM 1.10 does not honour it),
+          and the client no longer needs an RFC 8693 exchange to get one,
         * carry scope/context `vo.read`,
         * be unexpired.
     On success it returns the ASCII payload "protected resource data".
@@ -137,16 +141,25 @@ def _scopes(claims):
 def validate_token(token, signing_key):
     """Pure validation helper (kept separate so it is unit-testable).
 
-    Returns the decoded claims. Raises jwt exceptions or PermissionError.
+    Checks signature, `iss`, `exp` and the required scope, and `aud` WHEN THE
+    TOKEN HAS ONE: a present `aud` must include RESOURCE_ID (a token minted for
+    another service is refused), an absent one is accepted. Returns the decoded
+    claims. Raises jwt exceptions or PermissionError.
     """
     claims = jwt.decode(
         token,
         signing_key,
         algorithms=["RS256"],
-        audience=RESOURCE_ID,   # RS verifies aud == its own id
         issuer=ISSUER,
-        options={"require": ["exp", "aud", "iss"]},
+        # PyJWT would insist on an `aud` the moment we hand it an audience, so
+        # `aud` is checked by hand below, and only when present.
+        options={"require": ["exp", "iss"], "verify_aud": False},
     )
+    if "aud" in claims:
+        aud = claims["aud"]
+        audiences = [aud] if isinstance(aud, str) else list(aud or [])
+        if RESOURCE_ID not in audiences:
+            raise jwt.InvalidAudienceError("Invalid audience")
     if REQUIRED_SCOPE not in _scopes(claims):
         raise PermissionError("insufficient_scope")
     return claims
@@ -199,7 +212,7 @@ def protected(anything=None):
             mimetype="text/plain",
         )
 
-    # Token good, audience-bound to us, has vo.read -> hand over the file.
+    # Token good (and, if it names an audience, that is us), has vo.read -> file.
     return Response(
         _payload(),
         status=200,

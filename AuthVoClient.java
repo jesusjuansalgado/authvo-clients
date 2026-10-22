@@ -45,7 +45,8 @@ import java.util.regex.Pattern;
  * </ol>
  * The token request then carries the matched resource as an RFC 8707
  * {@code resource} indicator so a cooperating issuer can bind the token's
- * audience to it. (RFC 8693 token exchange can narrow it further -- optional.)
+ * audience to it. (RFC 8693 token exchange can narrow it further -- OPTIONAL, off by
+ * default; enable it with the constructor flag or AUTHVO_TOKEN_EXCHANGE=1.)
  *
  * <h2>The flow (step numbers match the {@code stepN*} methods below)</h2>
  * <pre>
@@ -99,13 +100,13 @@ public class AuthVoClient {
 
     private final String scope;          // requested at the device grant (step 5)
     private final String exchangeScope;  // requested on an exchanged token (step 5d)
-    private final boolean tokenExchange; // also run the RFC 8693 exchange (step 5d)
+    private final boolean tokenExchange; // also run the RFC 8693 exchange (step 5d); off by default
     private String clientId;             // may start null and be filled by DCR
     private int lastStatus = -1;         // HTTP status of the final resource call
 
-    /** Convenience: default scopes, optionally a preconfigured client_id. */
+    /** Convenience: default scopes, no token exchange, optionally a preconfigured client_id. */
     public AuthVoClient(String clientId) {
-        this("openid vo.read", "vo.read", clientId, true);
+        this("openid vo.read", "vo.read", clientId, false);
     }
 
     public AuthVoClient(String scope, String exchangeScope, String clientId, boolean tokenExchange) {
@@ -461,10 +462,10 @@ public class AuthVoClient {
     }
 
     /**
-     * Step 5d (optional): RFC 8693 token exchange -- swap the token for one whose
-     * {@code audience} is the target resource, so it cannot be replayed against any other
-     * service. Off by default (the {@code resource} indicator is the primary mechanism);
-     * needs a client the IAM allows to use this grant. We send both `audience`
+     * Step 5d (optional, off by default): RFC 8693 token exchange -- swap the token for
+     * one whose {@code audience} is the target resource, so it cannot be replayed against
+     * any other service. (The {@code resource} indicator in step 5c is the primary
+     * mechanism); this needs a client the IAM allows to use the exchange grant. We send both `audience`
      * (RFC 8693) and `resource` (RFC 8707).
      */
     private JsonNode step5dTokenExchange(AsMetadata meta, String cid, JsonNode token,
@@ -756,7 +757,8 @@ public class AuthVoClient {
     /**
      * Entry point: take a resource URL (argv[0] or env AUTHVO_RESOURCE) and run.
      * Env AUTHVO_CLIENT_ID supplies a preconfigured client_id (skips step 4);
-     * AUTHVO_TOKEN_EXCHANGE=0 skips the RFC 8693 exchange. A failed security check prints
+     * AUTHVO_TOKEN_EXCHANGE=1 ALSO runs the RFC 8693 exchange (off by default; needs a
+     * client the IAM lets use that grant). A failed security check prints
      * "ABORT: ..." and exits 1, as does a resource that does not answer 200.
      */
     public static void main(String[] args) throws Exception {
@@ -765,7 +767,7 @@ public class AuthVoClient {
             System.err.println("usage: AuthVoClient <protected-resource-url>");
             System.exit(2);
         }
-        boolean exchange = !"0".equals(System.getenv("AUTHVO_TOKEN_EXCHANGE"));
+        boolean exchange = "1".equals(System.getenv("AUTHVO_TOKEN_EXCHANGE"));
         AuthVoClient client = new AuthVoClient("openid vo.read", "vo.read",
                 System.getenv("AUTHVO_CLIENT_ID"), exchange);
         try {

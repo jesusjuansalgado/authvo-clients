@@ -7,7 +7,8 @@
 #   - the `vo.read` system scope (the resource server requires it)
 #   - two login users:  admin / password  (admin),  vouser / vouser  (user)
 #   - the public `authvo-client` (device-code + token-exchange) used by
-#     demo.py / auto_demo.py via seed/client_id
+#     demo.py / auto_demo.py via seed/client_id. Token exchange is OPTIONAL in the
+#     clients now (off by default); the grant is kept so it can be switched on.
 #
 # human_demo.py / HumanDemo.java don't need the client (they self-register), but
 # they DO need a login user and the vo.read scope, both created here.
