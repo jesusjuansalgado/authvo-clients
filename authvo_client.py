@@ -1,71 +1,85 @@
 #!/usr/bin/env python3
 """
-Reference VO client for the unified AuthVO bearer-token flow.
-================================================================
+Reference VO client for the AuthVO bearer-token flow (RFC 9728-conformant).
+===========================================================================
 
 This is a *reference implementation*, written to be read. It walks the complete
-AuthVO bearer-token flow described in the IVOA DSP "Bearer Tokens — open issues"
-deck, end to end, with copious logging so you can watch each step happen.
+AuthVO bearer-token flow end to end, with copious logging so you can watch each
+step happen. (Java twin: AuthVoClient.java -- the two behave identically.)
 
 WHY THIS EXISTS (the threat it defends against)
 -----------------------------------------------
 In plain OAuth2 a client that hits a protected service is told "go get a token
 from issuer X". But nothing ties issuer X to the service that named it. A
-*malicious* service (the "evil service") can therefore point the client at a
-spoofed metadata document and harvest a real token that was minted for it.
+*malicious* service (the "evil service") can therefore name a REAL issuer and
+harvest a real token that the user was tricked into obtaining for it.
 
-AuthVO closes that hole with two ideas, both implemented below:
+AuthVO closes that hole with two independent checks, both implemented below:
 
-  1. The resource server's 401 hands back ONLY a *pointer* to a metadata
-     document (the "sidecar"), never the authoritative descriptor itself. The
-     pointer is UNTRUSTED until it passes the domain-proxy check.
+  1. The resource server publishes Protected Resource Metadata (PRM, RFC 9728)
+     at ITS OWN well-known URL, and the 401 challenge only POINTS at it. The
+     pointer is UNTRUSTED. The PRM must describe the resource we actually asked
+     for: its `resource` identifier must COVER the requested URL (step 2).
 
-  2. The DOMAIN-PROXY CHECK (step 4) refuses to trust the issuer named in that
-     document unless (a) the document is served from the SAME origin as the
-     issuer it names, and (b) the resource we actually called is one the
-     document is authoritative for. Co-locating the sidecar and the issuer on
-     one origin is what makes a forged `evil.com` descriptor fail gate (a).
+  2. But a resource server can say anything about itself, including "my issuer
+     is the real IAM". So the binding is checked from the OTHER side (step 3):
+     the AUTHORIZATION SERVER's own RFC 8414 metadata must (a) carry the very
+     issuer the PRM named, and (b) list the requested resource in its
+     `protected_resources` member (RFC 9728 section 4). Only the issuer can vouch
+     for which resources it serves; a resource claiming an issuer that does not
+     list it is refused BEFORE the user is asked to log in. An issuer that
+     publishes no such list is refused too: absence is a failure, not a pass.
 
-Once the issuer is trusted, the token we obtain is narrowed (its `aud` claim is
-bound) to exactly the target resource, so even if it leaked it could not be
-replayed against a different service.
+Once both hold, the user logs in (device grant) and the token request carries the
+matched resource as an RFC 8707 `resource` indicator, so a cooperating issuer
+can bind the token's audience to it. (Optionally the token can be narrowed
+further by RFC 8693 token exchange -- OFF by default, enable it with
+AuthVoClient(token_exchange=True) or AUTHVO_TOKEN_EXCHANGE=1.)
 
-THE FLOW, STEP BY STEP (numbers match the slide deck and the methods below)
----------------------------------------------------------------------------
-  1  GET the protected resource anonymously
-  2  401 "token not found" -> sidecar location (an UNTRUSTED pointer)
-  3  GET the sidecar at the IAM proxy -> issuer URL + protected-resources list
-  4  DOMAIN PROXY CHECK (two gates, ABORT on failure):
-        (a) the sidecar and the issuer it names share the same origin/proxy
-        (b) the redirecting service is in the sidecar's list (path-prefix match)
-  5  GET the Authorization Server metadata (RFC 8414) from the named issuer
-  6  Dynamic client registration (RFC 7591) -> client_id        [if needed]
-  7  Device authorization request (RFC 8628)
-  8  User authenticates and grants (we show the service + issuer)
-  9  Poll the token endpoint (RFC 8628) with resource indicator (RFC 8707)
- 10  Token exchange (RFC 8693): audience=<resource> -> narrowed, aud-bound token
- 11  Access the resource with the narrowed token (RS verifies aud server-side)
- 12  (optional) refresh + re-exchange per resource
+THE FLOW, STEP BY STEP (numbers match the methods below)
+--------------------------------------------------------
+  1  GET the protected resource anonymously (NO redirects). Expect
+     401 + WWW-Authenticate: Bearer resource_metadata="<url>"   (UNTRUSTED pointer)
+  2  GET the PRM at that pointer over HTTPS (NO redirects). ABORT unless the
+     PRM `resource` covers the URL we asked for.                 (RFC 9728 3, 3.3)
+  3  RESOURCE CHECK (ABORT before any login on failure). For an issuer named in
+     the PRM, GET its RFC 8414 metadata (NO redirects) and require
+        (a) metadata `issuer` == the issuer the PRM named        (RFC 8414 3.3)
+        (b) `protected_resources` present AND covering our URL   (RFC 9728 4)
+     The first listed issuer that passes both is the one we use.
+  4  Client registration: preconfigured client_id, else RFC 7591 DCR.
+  5  Token: device authorization (RFC 8628) -> the user logs in and approves
+     (we show the resource AND the issuer) -> poll the token endpoint, sending
+     resource=<matched resource id> (RFC 8707). Optional RFC 8693 exchange
+     (off by default).
+  6  Present the token to the resource; the RS validates signature, iss, scope,
+     expiry, and aud when present.
+  7  (refresh would re-send the same `resource`; not implemented here)
 
-The token requested in steps 9-10 is bound to the *service-level* resource id
-that matched in gate (b), not to the dynamic deep URL the client started from.
-(So a DataLink deep link like .../download/obs123/file456 yields a token scoped
-to the whole service, e.g. https://src.example.org, which is what the resource
-server checks its own `aud` against.)
+"Covered" (steps 2 and 3b) means: equal to the identifier, or the same scheme,
+host and port with a path that extends it at a path-SEGMENT boundary. So
+https://src.example.org/vo covers https://src.example.org/vo/tap/async/1 but NOT
+https://src.example.org/vocab; a root identifier covers its whole origin.
+
+The token is requested for the resource id that matched in step 3(b), not for
+the dynamic deep URL the client started from. (So a DataLink deep link like
+.../download/obs123/file456 yields a token for the whole service, e.g.
+https://src.example.org, which is what the resource server expects.)
 
 RELEVANT STANDARDS
 ------------------
   RFC 6750  Bearer Token usage + the WWW-Authenticate challenge
   RFC 8414  Authorization Server Metadata (the /.well-known document)
-  RFC 9728  Protected Resource Metadata (the "sidecar")
+  RFC 9728  Protected Resource Metadata (sections 3, 3.3, 4, 5)
   RFC 7591  Dynamic Client Registration
   RFC 8628  Device Authorization Grant
   RFC 8707  Resource Indicators (the `resource` parameter)
-  RFC 8693  OAuth 2.0 Token Exchange (narrowing the audience)
+  RFC 8693  OAuth 2.0 Token Exchange (optional narrowing of the audience)
   RFC 9207  Authorization Server Issuer Identification (the `iss` check)
 
 Dependency:  requests   ->   pip install requests
 Usage:       python authvo_client.py https://src.example.org/datalink/download/obs123/file456
+TLS:         requests honours REQUESTS_CA_BUNDLE (handy for a local test CA).
 """
 
 # `from __future__ import annotations` lets us write modern type hints (e.g.
@@ -90,9 +104,11 @@ import requests
 # the step-by-step trace reads like a narrative of the flow.
 log = logging.getLogger("authvo")
 
-# The two well-known paths we try when discovering Authorization Server metadata.
+# The two well-known paths we use when discovering Authorization Server metadata.
 # RFC 8414 defines the first; the OpenID Connect discovery document is the second
-# and many issuers (including INDIGO IAM) serve it.
+# and many issuers (including INDIGO IAM) serve it. The RFC 8414 document is the
+# one the resource check (step 3) is performed on; OIDC discovery is only ever a
+# fallback for READING ENDPOINTS, never a way around check (b).
 WELL_KNOWN_AS = "/.well-known/oauth-authorization-server"
 WELL_KNOWN_OIDC = "/.well-known/openid-configuration"
 
@@ -116,9 +132,10 @@ class SecurityError(Exception):
 # --------------------------------------------------------------------------- #
 #  URL / origin helpers                                                       #
 #                                                                             #
-#  The domain-proxy check is entirely about comparing ORIGINS and PATHS, so   #
-#  these small, well-defined helpers are the security-critical core. Keep     #
-#  them simple and obviously correct.                                         #
+#  Steps 2 and 3 are entirely about comparing ORIGINS and PATHS, so these     #
+#  small, well-defined helpers are the security-critical core. Keep them      #
+#  simple and obviously correct. (AuthVoClient.java has the same helpers and  #
+#  both are tested against tests/coverage_vectors.json.)                      #
 # --------------------------------------------------------------------------- #
 
 def normalize_origin(url: str) -> str:
@@ -140,33 +157,60 @@ def normalize_origin(url: str) -> str:
 
 
 def same_origin(a: str, b: str) -> bool:
-    """True iff two URLs share scheme+host+port. The heart of gate (a)."""
+    """True iff two URLs share scheme+host+port."""
     return normalize_origin(a) == normalize_origin(b)
 
 
-def is_under(resource_url: str, listed_id: str) -> bool:
-    """Path-prefix membership at a path-segment boundary, same origin required.
+def _normalized_path(url: str) -> str:
+    """The URL's path with dot-segments resolved (RFC 3986 5.2.4), no trailing '/'.
 
-    This implements gate (b): is the resource we called covered by an id the
-    sidecar declares it is authoritative for? Matching is done on whole path
-    SEGMENTS so a listed `/datalink` covers `/datalink/...` but never the
-    unrelated `/datalinkX`.
-
-    `https://src.example.org`            covers any path on that origin.
-    `https://src.example.org/datalink`   covers `/datalink` and `/datalink/...`
-                                          but NOT `/datalinkX`.
+    Resolving "." and ".." (also when percent-encoded) matters for security:
+    without it https://h/vo/../other would look as if it were "under" /vo while
+    the server would actually serve /other. The root path comes back as "".
     """
-    # Origin must match first — a path prefix on a different host means nothing.
-    if not same_origin(resource_url, listed_id):
+    out: list[str] = []
+    for seg in (urlsplit(url).path or "/").split("/"):
+        s = seg.lower()
+        if s in (".", "%2e"):
+            continue
+        if s in ("..", ".%2e", "%2e.", "%2e%2e"):
+            if len(out) > 1:          # never pop the leading empty segment
+                out.pop()
+            continue
+        out.append(seg)
+    return "/".join(out).rstrip("/")
+
+
+def is_covered(url: str, resource_id: str) -> bool:
+    """Is `url` covered by the resource identifier `resource_id`?
+
+    Covered means: the same origin (scheme, host, port), and a path that is equal
+    to the identifier's or extends it AT A PATH-SEGMENT BOUNDARY (RFC 9728 3.3
+    compares a resource with the URL it was found for; AuthVO extends that to
+    deep URLs under one service-level identifier).
+
+        https://src.example.org            covers every path on that origin
+        https://src.example.org/vo         covers /vo and /vo/tap/async/1,
+                                           but NOT /vocab and NOT /vo/../other
+    """
+    # Origin must match first -- a path prefix on a different host means nothing.
+    if not same_origin(url, resource_id):
         return False
-    rp = urlsplit(resource_url).path or "/"
-    lp = urlsplit(listed_id).path or "/"
-    # A listed id with an empty / root path covers the whole origin.
-    if lp in ("", "/"):
+    up, rp = _normalized_path(url), _normalized_path(resource_id)
+    if rp == "":                       # a root identifier covers the whole origin
         return True
-    lp = lp.rstrip("/")
-    # Exact match, or a match at a segment boundary (note the trailing "/").
-    return rp == lp or rp.startswith(lp + "/")
+    return up == rp or up.startswith(rp + "/")
+
+
+def most_specific_cover(url: str, resource_ids: list[str]) -> Optional[str]:
+    """Of the identifiers that cover `url`, the most specific (longest path).
+
+    If an issuer lists both https://h and https://h/vo, a request under /vo
+    should get a token for the narrower one. Ties keep list order. None if no
+    identifier covers the URL.
+    """
+    covering = [r for r in resource_ids if is_covered(url, r)]
+    return max(covering, key=lambda r: len(_normalized_path(r)), default=None)
 
 
 def require_https(url: str, what: str) -> None:
@@ -201,17 +245,17 @@ def jwt_payload(token: str) -> Optional[dict]:
 # --------------------------------------------------------------------------- #
 #  Discovery results                                                          #
 #                                                                             #
-#  Tiny typed value objects for the two documents we discover, so the rest of #
-#  the code reads `sidecar.issuer` / `meta.token_endpoint` instead of poking  #
-#  at raw dicts.                                                              #
+#  Tiny typed value objects for the documents we discover, so the rest of the #
+#  code reads `prm.resource` / `meta.token_endpoint` instead of poking at raw #
+#  dicts.                                                                     #
 # --------------------------------------------------------------------------- #
 
 @dataclass
-class Sidecar:
-    """The parsed RFC 9728 Protected-Resource-Metadata document."""
-    url: str                                    # where we fetched it (for gate a)
-    issuer: str                                 # the AS it names
-    protected_resources: list[str] = field(default_factory=list)  # gate (b) list
+class ProtectedResourceMetadata:
+    """The parsed RFC 9728 Protected Resource Metadata (PRM) document."""
+    url: str                                    # where we fetched it
+    resource: str                               # what the RS says it is
+    authorization_servers: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -224,6 +268,13 @@ class ASMetadata:
     scopes_supported: list[str] = field(default_factory=list)
 
 
+@dataclass
+class ResourceCheck:
+    """What a passed resource check (step 3) hands to the rest of the flow."""
+    meta: ASMetadata       # the trusted issuer's endpoints
+    resource_id: str       # the protected_resources entry that covered our URL
+
+
 # --------------------------------------------------------------------------- #
 #  The client                                                                 #
 # --------------------------------------------------------------------------- #
@@ -231,189 +282,226 @@ class ASMetadata:
 class AuthVoClient:
     """Drives the whole flow. Construct it, then call .access(resource_url).
 
-    Each numbered _stepN_* method below is one step of the flow and is meant to
-    be read in order; access() simply calls them in sequence.
+    Each _stepN_* method below is one step of the flow and is meant to be read
+    in order; access() simply calls them in sequence.
     """
 
     def __init__(self, scope: str = "openid vo.read",
                  client_id: Optional[str] = None,
                  exchange_scope: str = "vo.read",
                  timeout: int = 30,
-                 open_browser: bool = False) -> None:
-        # `scope`          : requested at the device grant (step 7).
-        # `client_id`      : if given, we skip dynamic registration (step 6).
-        # `exchange_scope` : scope asked for on the narrowed token (step 10).
-        # `open_browser`   : auto-open the verification URL for the user (step 8).
+                 open_browser: bool = False,
+                 token_exchange: bool = False) -> None:
+        # `scope`          : requested at the device grant (step 5).
+        # `client_id`      : if given, we skip dynamic registration (step 4).
+        # `exchange_scope` : scope asked for on an exchanged token (step 5d).
+        # `open_browser`   : auto-open the verification URL for the user (step 5b).
+        # `token_exchange` : also run the RFC 8693 narrowing exchange (step 5d).
+        #                    OFF by default: the `resource` indicator on the token
+        #                    request (RFC 8707) is the primary audience mechanism.
         self.scope = scope
         self.client_id = client_id
         self.exchange_scope = exchange_scope
         self.timeout = timeout
         self.open_browser = open_browser
+        self.token_exchange = token_exchange
         # One requests.Session reused for connection pooling and a stable UA.
         self.http = requests.Session()
-        self.http.headers["User-Agent"] = "authvo-reference-client/1.0"
+        self.http.headers["User-Agent"] = "authvo-reference-client/2.0"
 
     # -- public entry point ------------------------------------------------- #
 
     def access(self, resource_url: str) -> requests.Response:
         """Run the full flow for one resource URL and return the final response.
 
-        Reads top-to-bottom as the 11 steps of the flow. Any security stop along
-        the way raises SecurityError and nothing further happens.
+        Reads top-to-bottom as the steps of the flow. Any security stop along the
+        way raises SecurityError and nothing further happens -- in particular,
+        steps 1-3 involve no user interaction and no credentials, so a failed
+        check costs the user nothing.
         """
         # The resource itself must be HTTPS before we even knock on its door.
         require_https(resource_url, "Protected resource")
 
-        challenge = self._step1_probe(resource_url)                       # 1 + 2
-        sidecar_url = self._step2_pointer(challenge)                      # 2
-        sidecar = self._step3_fetch_sidecar(sidecar_url)                  # 3
-        # Step 4 returns the *service-level* resource id our URL matched; that id
-        # (not the deep URL) is what the token will be bound to.
-        resource_id = self._step4_domain_proxy_check(resource_url, sidecar_url, sidecar)
-        meta = self._step5_as_metadata(sidecar.issuer)                   # 5
-        client_id = self._step6_register(meta)                           # 6
-        device = self._step7_device_authorization(meta, client_id)       # 7
-        self._step8_prompt_user(device, resource_url, sidecar.issuer)    # 8
-        token = self._step9_poll_token(meta, client_id, device, resource_id)      # 9
-        narrowed = self._step10_token_exchange(meta, client_id, token, resource_id)  # 10
-        return self._step11_access(resource_url, narrowed, resource_id)  # 11
+        pointer = self._step1_probe(resource_url)                         # 1
+        prm = self._step2_prm(resource_url, pointer)                      # 2
+        # Step 3 returns the trusted issuer's metadata plus the resource id our
+        # URL matched; that id (not the deep URL) is what the token is for.
+        check = self._step3_resource_check(resource_url, prm)             # 3
+        meta, resource_id = check.meta, check.resource_id
+        client_id = self._step4_register(meta)                            # 4
+        device = self._step5a_device_authorization(meta, client_id)       # 5
+        self._step5b_prompt_user(device, resource_url, meta.issuer, resource_id)
+        token = self._step5c_poll_token(meta, client_id, device, resource_id)
+        if self.token_exchange:
+            token = self._step5d_token_exchange(meta, client_id, token, resource_id)
+        return self._step6_access(resource_url, token)                    # 6
 
     # -- step 1 ------------------------------------------------------------- #
 
     def _step1_probe(self, resource_url: str) -> str:
-        """Knock on the resource with no credentials and expect a 401 challenge.
+        """Knock on the resource with no credentials; return the PRM pointer.
 
         A real client starts knowing only the resource URL. We send no token and
         REFUSE to follow redirects (a redirect could itself be a spoofing trick);
-        the only thing we accept here is a 401 that carries a discovery pointer.
+        the only thing we accept here is a 401 whose WWW-Authenticate carries a
+        `resource_metadata` pointer (RFC 9728 section 5). The pointer is UNTRUSTED:
+        it is just where to look, and step 2 decides whether to believe it.
         """
-        log.info("STEP 1  GET %s  (anonymous)", resource_url)
+        log.info("STEP 1  GET %s  (anonymous, no redirects)", resource_url)
         r = self.http.get(resource_url, timeout=self.timeout, allow_redirects=False)
         if r.status_code != 401:
-            # Already accessible, or some other status — nothing to discover.
+            # Already accessible, redirected, or some other status: nothing to
+            # discover (and a redirect is never followed).
             raise SecurityError(
                 f"Expected 401 with a discovery pointer, got {r.status_code}")
         www = r.headers.get("WWW-Authenticate", "")
-        log.info("STEP 2  401  WWW-Authenticate: %s", www or "(missing)")
-        return www
-
-    # -- step 2 ------------------------------------------------------------- #
+        log.info("        401  WWW-Authenticate: %s", www or "(missing)")
+        pointer = self._parse_resource_metadata(www)
+        log.info("        -> PRM pointer (untrusted): %s", pointer)
+        return pointer
 
     @staticmethod
-    def _step2_pointer(www_authenticate: str) -> str:
-        """Extract the sidecar location. It is an UNTRUSTED pointer at this stage.
+    def _parse_resource_metadata(www_authenticate: str) -> str:
+        """Extract the `resource_metadata` URL from a Bearer challenge.
 
-        The 401's WWW-Authenticate looks like:
-            Bearer resource_metadata="https://iam.example/.well-known/..."
-        We pull out that URL. We do NOT trust it yet — it is just where to look;
-        step 4 decides whether to believe what we find there. We accept both the
-        quoted and bare forms of the parameter for robustness.
+        The header looks like:
+            Bearer resource_metadata="https://src.example/.well-known/..."
+        We accept both the quoted and bare forms of the parameter for robustness.
         """
         m = re.search(r'resource_metadata\s*=\s*"([^"]+)"', www_authenticate)
         if not m:
             m = re.search(r'resource_metadata\s*=\s*([^,\s]+)', www_authenticate)
         if not m:
             raise SecurityError("401 did not carry a resource_metadata pointer")
-        url = m.group(1)
-        log.info("        -> sidecar pointer (untrusted): %s", url)
-        return url
+        return m.group(1)
 
-    # -- step 3 ------------------------------------------------------------- #
+    # -- step 2 ------------------------------------------------------------- #
 
-    def _step3_fetch_sidecar(self, sidecar_url: str) -> Sidecar:
-        """Fetch and parse the RFC 9728 descriptor the pointer led us to.
+    def _step2_prm(self, resource_url: str, pointer: str) -> ProtectedResourceMetadata:
+        """Fetch the PRM and require that it describes the resource we asked for.
 
-        It tells us which Authorization Server (issuer) governs this resource and
-        which resource ids that descriptor is authoritative for. Still untrusted
-        until step 4 — here we only parse it.
+        RFC 9728 section 3: the PRM is a JSON document published BY THE RESOURCE
+        SERVER. We fetch it over HTTPS and refuse redirects. Then, per section 3.3,
+        the `resource` it declares must be consistent with the resource we are
+        accessing -- here, it must COVER the URL we asked for (see is_covered). A
+        PRM about some other resource is useless to us and is a sign of spoofing,
+        so we abort.
         """
-        require_https(sidecar_url, "Sidecar (protected-resource metadata)")
-        log.info("STEP 3  GET sidecar %s", sidecar_url)
-        doc = self._get_json(sidecar_url)
+        require_https(pointer, "PRM pointer")
+        log.info("STEP 2  GET PRM %s  (no redirects)", pointer)
+        doc = self._get_json(pointer, "Protected Resource Metadata")
 
-        # `authorization_servers` is required; we use the first issuer it names.
-        issuers = doc.get("authorization_servers") or []
-        if not issuers:
-            raise SecurityError("sidecar did not list any authorization_servers")
-        issuer = issuers[0]
+        resource = doc.get("resource")
+        if not isinstance(resource, str) or not resource:
+            raise SecurityError("PRM has no `resource` member")
+        require_https(resource, "PRM resource identifier")
+        servers = doc.get("authorization_servers")
+        if (not isinstance(servers, list) or not servers
+                or not all(isinstance(s, str) for s in servers)):
+            raise SecurityError("PRM did not list any authorization_servers")
+        log.info("        resource=%s  authorization_servers=%s", resource, servers)
 
-        # `protected_resources` is the authoritative allow-list (IVOA extension);
-        # fall back to the standard single `resource` value if absent.
-        listed = doc.get("protected_resources")
-        if not listed:
-            single = doc.get("resource")
-            listed = [single] if single else []
-        log.info("        issuer=%s  protected_resources=%s", issuer, listed)
-        return Sidecar(url=sidecar_url, issuer=issuer, protected_resources=listed)
-
-    # -- step 4: the two gates --------------------------------------------- #
-
-    def _step4_domain_proxy_check(self, resource_url: str, sidecar_url: str,
-                                  sidecar: Sidecar) -> str:
-        """THE security crux. Two gates; either failing aborts the whole flow.
-
-        Returns the resource id (from the sidecar's list) that our URL matched —
-        this is what the token will be requested and bound for.
-        """
-        log.info("STEP 4  DOMAIN PROXY CHECK")
-
-        # Gate (a): the sidecar and the issuer it names must share the origin.
-        # This is what a forged descriptor on evil.com cannot satisfy: it would
-        # have to be served from the real issuer's origin to pass.
-        if not same_origin(sidecar_url, sidecar.issuer):
+        if not is_covered(resource_url, resource):
             raise SecurityError(
-                "GATE (a) FAILED: sidecar origin %s != issuer origin %s"
-                % (normalize_origin(sidecar_url), normalize_origin(sidecar.issuer)))
-        log.info("        gate (a) OK: sidecar & issuer share origin %s",
-                 normalize_origin(sidecar.issuer))
+                "STEP 2 FAILED: the PRM's resource %s does not cover the requested URL %s"
+                % (resource, resource_url))
+        log.info("        OK: PRM resource covers the requested URL")
+        return ProtectedResourceMetadata(url=pointer, resource=resource,
+                                         authorization_servers=servers)
 
-        # Gate (b): the redirecting service must itself be in the sidecar's list.
-        # i.e. the descriptor must actually claim authority over the resource we
-        # called — not merely be a valid descriptor for some other resource.
-        matched = next((rid for rid in sidecar.protected_resources
-                        if is_under(resource_url, rid)), None)
-        if matched is None:
-            raise SecurityError(
-                "GATE (b) FAILED: %s is not covered by any listed resource %s"
-                % (resource_url, sidecar.protected_resources))
-        log.info("        gate (b) OK: %s is under listed resource %s",
-                 resource_url, matched)
-        log.info("        -> token will be requested for resource id: %s", matched)
-        return matched
+    # -- step 3: the resource check ---------------------------------------- #
 
-    # -- step 5 ------------------------------------------------------------- #
+    def _step3_resource_check(self, resource_url: str,
+                              prm: ProtectedResourceMetadata) -> ResourceCheck:
+        """THE security crux. Ask the ISSUER whether it really serves this resource.
 
-    def _step5_as_metadata(self, issuer: str) -> ASMetadata:
-        """Now that the issuer is trusted, discover its endpoints (RFC 8414/OIDC).
-
-        We try the RFC 8414 URL first, then the OIDC discovery URL. Crucially we
-        verify that the document's own `issuer` value equals the issuer we asked
-        for — a mismatch means the metadata is not really this issuer's, abort.
+        The PRM came from the resource server, which can claim any issuer it
+        likes. So for each issuer the PRM names we fetch ITS OWN RFC 8414 metadata
+        and require, before any user login:
+          (a) metadata `issuer` == the issuer the PRM named (RFC 8414 3.3), and
+          (b) `protected_resources` is present and one entry covers our URL
+              (RFC 9728 4).
+        The first issuer that passes both is used; if none does we abort with
+        every reason. An ABSENT `protected_resources` is a failure, never a pass.
         """
-        require_https(issuer, "Issuer")
-        for url in self._as_metadata_urls(issuer):
+        log.info("STEP 3  RESOURCE CHECK")
+        failures = []
+        for issuer in prm.authorization_servers:
             try:
-                log.info("STEP 5  GET AS metadata %s", url)
-                doc = self._get_json(url)
-            except requests.HTTPError:
-                # This well-known variant 404'd; try the next candidate URL.
+                check = self._check_issuer(resource_url, issuer)
+            except SecurityError as e:
+                log.info("        issuer %s REJECTED: %s", issuer, e)
+                failures.append(f"{issuer}: {e}")
                 continue
-            if doc.get("issuer") != issuer:
-                raise SecurityError(
-                    "AS metadata issuer %r does not match expected %r"
-                    % (doc.get("issuer"), issuer))
-            return ASMetadata(
-                issuer=issuer,
-                token_endpoint=doc["token_endpoint"],
-                device_authorization_endpoint=doc["device_authorization_endpoint"],
-                registration_endpoint=doc.get("registration_endpoint"),
-                scopes_supported=doc.get("scopes_supported", []),
-            )
-        raise SecurityError("could not retrieve AS metadata for %s" % issuer)
+            log.info("        issuer %s ACCEPTED", issuer)
+            log.info("        -> token will be requested for resource id: %s",
+                     check.resource_id)
+            return check
+        raise SecurityError("STEP 3 FAILED: no authorization server vouches for %s (%s)"
+                            % (resource_url, "; ".join(failures)))
+
+    def _check_issuer(self, resource_url: str, issuer: str) -> ResourceCheck:
+        """Run checks (a) and (b) against ONE issuer, then read its endpoints."""
+        require_https(issuer, "Issuer")
+        as_url, oidc_url = self._as_metadata_urls(issuer)
+        log.info("        GET AS metadata %s  (RFC 8414, no redirects)", as_url)
+        doc = self._get_json(as_url, "RFC 8414 metadata")
+
+        # (a) The document must really be this issuer's. RFC 8414 3.3: the
+        # `issuer` value MUST be identical to the one used to build the URL.
+        if doc.get("issuer") != issuer:
+            raise SecurityError("check (a): metadata issuer %r != the issuer %r named by the PRM"
+                                % (doc.get("issuer"), issuer))
+        log.info("        check (a) OK: metadata issuer == %s", issuer)
+
+        # (b) The issuer must list the resource. Absent list == failure.
+        listed = doc.get("protected_resources")
+        if listed is None:
+            raise SecurityError("check (b): the issuer publishes no protected_resources "
+                                "(an absent list is a failure)")
+        if not isinstance(listed, list) or not all(isinstance(x, str) for x in listed):
+            raise SecurityError("check (b): protected_resources is not a list of strings")
+        matched = most_specific_cover(resource_url, listed)
+        if matched is None:
+            raise SecurityError("check (b): %s is not covered by the issuer's protected_resources %s"
+                                % (resource_url, listed))
+        log.info("        check (b) OK: %s is covered by listed resource %s",
+                 resource_url, matched)
+
+        return ResourceCheck(meta=self._endpoints(doc, issuer, oidc_url), resource_id=matched)
+
+    def _endpoints(self, doc: dict, issuer: str, oidc_url: str) -> ASMetadata:
+        """Read the endpoints we need from the (already vetted) RFC 8414 document.
+
+        If the RFC 8414 document lacks an endpoint we need, fall back to the OIDC
+        discovery document -- but ONLY to read endpoints (its issuer must match
+        too). This never substitutes for the checks done on the RFC 8414 document.
+        """
+        needed = ["token_endpoint", "device_authorization_endpoint"]
+        if self.client_id is None:
+            needed.append("registration_endpoint")
+        if any(not doc.get(k) for k in needed):
+            log.info("        endpoints missing from the RFC 8414 document; "
+                     "reading OIDC discovery %s (endpoints only)", oidc_url)
+            oidc = self._get_json(oidc_url, "OIDC discovery")
+            if oidc.get("issuer") != issuer:
+                raise SecurityError("OIDC discovery issuer %r != %r"
+                                    % (oidc.get("issuer"), issuer))
+            doc = {**oidc, **{k: v for k, v in doc.items() if v}}
+        for k in ("token_endpoint", "device_authorization_endpoint"):
+            if not doc.get(k):
+                raise SecurityError(f"the issuer's metadata has no {k}")
+        return ASMetadata(
+            issuer=issuer,
+            token_endpoint=doc["token_endpoint"],
+            device_authorization_endpoint=doc["device_authorization_endpoint"],
+            registration_endpoint=doc.get("registration_endpoint"),
+            scopes_supported=doc.get("scopes_supported", []),
+        )
 
     @staticmethod
-    def _as_metadata_urls(issuer: str) -> list[str]:
-        """Build the two candidate metadata URLs for an issuer.
+    def _as_metadata_urls(issuer: str) -> tuple[str, str]:
+        """Build the (RFC 8414, OIDC) metadata URLs for an issuer.
 
         The subtlety is WHERE the well-known suffix goes when the issuer has a
         path component (e.g. https://host/iam):
@@ -422,46 +510,46 @@ class AuthVoClient:
         """
         p = urlsplit(issuer)
         base = p.path.rstrip("/")
-        # RFC 8414: insert the well-known suffix between host and path.
         rfc8414 = urlunsplit((p.scheme, p.netloc, WELL_KNOWN_AS + base, "", ""))
-        # OIDC style: append discovery doc after the issuer path.
         oidc = urlunsplit((p.scheme, p.netloc, base + WELL_KNOWN_OIDC, "", ""))
-        return [rfc8414, oidc]
+        return rfc8414, oidc
 
-    # -- step 6 ------------------------------------------------------------- #
+    # -- step 4 ------------------------------------------------------------- #
 
-    def _step6_register(self, meta: ASMetadata) -> str:
+    def _step4_register(self, meta: ASMetadata) -> str:
         """Obtain a client_id: reuse a preconfigured one, else self-register.
 
         Dynamic Client Registration (RFC 7591) lets a brand-new client mint its
-        own id with no prior setup. We register as a PUBLIC client (no secret —
-        appropriate for the device flow on a native app) declaring the two grants
-        we need: device_code and token-exchange.
+        own id with no prior setup. We register as a PUBLIC client (no secret --
+        appropriate for the device flow on a native app) declaring the device_code
+        grant, plus token-exchange only if we will actually use it.
 
         NB: some IAMs (e.g. INDIGO) forbid self-registered clients from requesting
-        token-exchange. Against those, pass a preconfigured client_id instead, or
-        use the `aud` request parameter on the device grant (see human_demo.py).
+        token-exchange. Against those, leave token exchange off (it is optional)
+        or pass a preconfigured client_id.
         """
         if self.client_id:
-            log.info("STEP 6  using preconfigured client_id=%s", self.client_id)
+            log.info("STEP 4  using preconfigured client_id=%s", self.client_id)
             return self.client_id
         if not meta.registration_endpoint:
             raise SecurityError("no client_id and the IAM offers no registration endpoint")
-        log.info("STEP 6  POST register (RFC 7591) %s", meta.registration_endpoint)
+        log.info("STEP 4  POST register (RFC 7591) %s", meta.registration_endpoint)
+        grants = [GRANT_DEVICE_CODE] + ([GRANT_TOKEN_EXCHANGE] if self.token_exchange else [])
         body = {
             "client_name": "authvo-reference-client",
-            "grant_types": [GRANT_DEVICE_CODE, GRANT_TOKEN_EXCHANGE],
+            "grant_types": grants,
             "token_endpoint_auth_method": "none",   # public client
             "application_type": "native",
+            "scope": self.scope,
         }
         doc = self._post_json(meta.registration_endpoint, body)
         self.client_id = doc["client_id"]
         log.info("        -> client_id=%s", self.client_id)
         return self.client_id
 
-    # -- step 7 ------------------------------------------------------------- #
+    # -- step 5 ------------------------------------------------------------- #
 
-    def _step7_device_authorization(self, meta: ASMetadata, client_id: str) -> dict:
+    def _step5a_device_authorization(self, meta: ASMetadata, client_id: str) -> dict:
         """Start the Device Authorization Grant (RFC 8628).
 
         We send our client_id and the scopes we want; the IAM returns a
@@ -469,7 +557,7 @@ class AuthVoClient:
         (which the human uses). This grant suits CLIs/headless clients because
         the user authenticates in a normal browser, not in our process.
         """
-        log.info("STEP 7  POST device_authorization (RFC 8628)")
+        log.info("STEP 5  POST device_authorization (RFC 8628)")
         doc = self._post_form(meta.device_authorization_endpoint, {
             "client_id": client_id,
             "scope": self.scope,
@@ -478,47 +566,50 @@ class AuthVoClient:
             raise SecurityError("device authorization response missing device_code")
         return doc
 
-    # -- step 8 ------------------------------------------------------------- #
-
-    def _step8_prompt_user(self, device: dict, resource_url: str, issuer: str) -> None:
+    def _step5b_prompt_user(self, device: dict, resource_url: str, issuer: str,
+                            resource_id: str) -> None:
         """Tell the human where to go and what they are authorizing.
 
-        We show BOTH the resource and the identity provider so the user can
-        sanity-check that they are logging in to the expected IAM for the
-        expected service. The client never sees the user's credentials — they are
-        typed into the IAM's own page.
+        We show the resource, the resource id the token will be for, AND the
+        identity provider, so the user can sanity-check that they are logging in
+        to the expected IAM for the expected service. The client never sees the
+        user's credentials -- they are typed into the IAM's own page.
         """
         # verification_uri_complete embeds the user_code; prefer it when present.
         uri = device.get("verification_uri_complete") or device["verification_uri"]
-        log.info("STEP 8  user action required")
+        log.info("        user action required")
         print("\n" + "=" * 64)
         print("  Authorize access to : %s" % resource_url)
+        print("  Token is for        : %s" % resource_id)
         print("  Identity provider   : %s" % issuer)
         print("  Open                : %s" % uri)
         # Only print the code separately if it is not already baked into the URL.
         if "user_code" not in (device.get("verification_uri_complete") or ""):
             print("  Enter code          : %s" % device.get("user_code", ""))
         print("=" * 64 + "\n")
+        # The user (or a wrapping script) must see this NOW, even when stdout is a
+        # pipe and therefore block-buffered: the flow cannot continue without it.
+        sys.stdout.flush()
         if self.open_browser:
             try:
                 webbrowser.open(uri)
             except Exception:
-                pass  # headless box / no browser — the printed URL still works
+                pass  # headless box / no browser -- the printed URL still works
 
-    # -- step 9 ------------------------------------------------------------- #
-
-    def _step9_poll_token(self, meta: ASMetadata, client_id: str,
-                          device: dict, resource_id: str) -> dict:
+    def _step5c_poll_token(self, meta: ASMetadata, client_id: str,
+                           device: dict, resource_id: str) -> dict:
         """Poll the token endpoint until the user approves (or we time out).
 
         Per RFC 8628 we poll at `interval` seconds and handle two non-error
         signals: `authorization_pending` (keep waiting) and `slow_down` (back off
-        by 5s). We also pass the RFC 8707 `resource` indicator so a cooperating
-        IAM can already scope the broad token toward the target.
+        by 5s). Every poll carries the RFC 8707 `resource` indicator -- the id
+        that matched in step 3(b) -- so a cooperating issuer can bind the token's
+        audience to exactly that resource. If the token is a JWT we log its `aud`
+        for information only: the resource server, not we, enforces it.
         """
         interval = int(device.get("interval", 5))
         deadline = time.time() + int(device.get("expires_in", 300))
-        log.info("STEP 9  polling token endpoint (resource=%s)", resource_id)
+        log.info("        polling token endpoint (resource=%s)", resource_id)
         while time.time() < deadline:
             time.sleep(interval)  # RFC 8628: wait BEFORE each poll
             resp = self.http.post(meta.token_endpoint, data={
@@ -526,12 +617,13 @@ class AuthVoClient:
                 "device_code": device["device_code"],
                 "client_id": client_id,
                 "resource": resource_id,          # RFC 8707 resource indicator
-            }, timeout=self.timeout)
+            }, timeout=self.timeout, allow_redirects=False)
             doc = resp.json()
             if resp.status_code == 200:
-                # Got a token. Sanity-check the issuer before using it (step 11).
+                # Got a token. Sanity-check the issuer before using it (step 6).
                 self._validate_issuer(doc, meta.issuer, "access token")
                 log.info("        -> access token acquired")
+                self._log_aud(doc, "access token")
                 return doc
             err = doc.get("error")
             if err == "authorization_pending":
@@ -544,19 +636,18 @@ class AuthVoClient:
                                 % (err, doc.get("error_description", "")))
         raise SecurityError("device authorization timed out")
 
-    # -- step 10 ------------------------------------------------------------ #
-
-    def _step10_token_exchange(self, meta: ASMetadata, client_id: str,
+    def _step5d_token_exchange(self, meta: ASMetadata, client_id: str,
                                token: dict, resource_id: str) -> dict:
-        """Exchange the broad token for one narrowed to exactly this resource.
+        """Optional: exchange the token for one narrowed to exactly this resource.
 
-        RFC 8693 token exchange: we hand in the access token from step 9 and ask
+        RFC 8693 token exchange: we hand in the access token from step 5c and ask
         for a new token whose `audience` is the target resource id. The result is
-        an `aud`-bound token — if it leaked, it could not be replayed against any
-        other service, because that other service's `aud` check would reject it.
-        We send both `audience` (RFC 8693) and `resource` (RFC 8707) for breadth.
+        an `aud`-bound token that cannot be replayed against any other service.
+        Off by default (the `resource` indicator on the token request is the
+        primary mechanism); it needs a client the IAM allows to use this grant.
+        We send both `audience` (RFC 8693) and `resource` (RFC 8707).
         """
-        log.info("STEP 10  token exchange (RFC 8693)  audience=%s", resource_id)
+        log.info("STEP 5d token exchange (RFC 8693)  audience=%s", resource_id)
         doc = self._post_form(meta.token_endpoint, {
             "grant_type": GRANT_TOKEN_EXCHANGE,
             "client_id": client_id,
@@ -566,27 +657,24 @@ class AuthVoClient:
             "resource": resource_id,             # RFC 8707, belt-and-braces
             "scope": self.exchange_scope,
         })
-        self._validate_issuer(doc, meta.issuer, "narrowed token")
-        # Decode (without verifying) just to log the resulting aud for the trace.
-        payload = jwt_payload(doc["access_token"])
-        if payload and "aud" in payload:
-            log.info("        -> narrowed token aud=%s", payload["aud"])
+        self._validate_issuer(doc, meta.issuer, "exchanged token")
+        self._log_aud(doc, "exchanged token")
         return doc
 
-    # -- step 11 ------------------------------------------------------------ #
+    # -- step 6 ------------------------------------------------------------- #
 
-    def _step11_access(self, resource_url: str, narrowed: dict,
-                       resource_id: str) -> requests.Response:
-        """Retry the original request, now presenting the narrowed bearer token.
+    def _step6_access(self, resource_url: str, token: dict) -> requests.Response:
+        """Retry the original request, now presenting the bearer token.
 
         This is where it pays off: the resource server independently verifies the
-        token's signature against the IAM's JWKS and checks iss / aud (== itself)
-        / scope / expiry. We just present the token and report the outcome.
+        token's signature against the IAM's JWKS and checks iss / scope / expiry,
+        and `aud` (== itself) whenever the token carries one. We just present the
+        token and report the outcome. Redirects are not followed: a redirect must
+        never carry our bearer token to a place the resource did not name.
         """
-        log.info("STEP 11  GET %s  with narrowed bearer token", resource_url)
-        r = self.http.get(resource_url, timeout=self.timeout, headers={
-            "Authorization": "Bearer " + narrowed["access_token"],
-        })
+        log.info("STEP 6  GET %s  with bearer token", resource_url)
+        r = self.http.get(resource_url, timeout=self.timeout, allow_redirects=False,
+                          headers={"Authorization": "Bearer " + token["access_token"]})
         if r.status_code == 200:
             log.info("        -> SUCCESS (%d bytes)", len(r.content))
         else:
@@ -594,6 +682,16 @@ class AuthVoClient:
         return r
 
     # -- shared HTTP / validation helpers ----------------------------------- #
+
+    @staticmethod
+    def _log_aud(token_doc: dict, what: str) -> None:
+        """Log a JWT token's `aud` for information. Never fails, never decides."""
+        payload = jwt_payload(token_doc.get("access_token", ""))
+        if payload is None:
+            log.info("        (%s is opaque; aud not inspectable)", what)
+        else:
+            log.info("        %s aud=%s (informational; the resource server enforces it)",
+                     what, payload.get("aud", "<absent>"))
 
     def _validate_issuer(self, token_doc: dict, issuer: str, what: str) -> None:
         """Client-side `iss` cross-check (RFC 9207 spirit).
@@ -613,26 +711,44 @@ class AuthVoClient:
 
     # --- thin wrappers around requests, with consistent error handling ----- #
 
-    def _get_json(self, url: str) -> dict:
-        """GET a URL and parse JSON, raising on any HTTP error status."""
-        r = self.http.get(url, timeout=self.timeout)
-        r.raise_for_status()
-        return r.json()
+    def _get_json(self, url: str, what: str) -> dict:
+        """GET a discovery document and parse JSON -- NEVER following redirects.
+
+        Fail closed: a redirect (3xx), any non-200 status, or a body that is not
+        a JSON object raises SecurityError. Refusing redirects matters because a
+        hostile server could bounce us to a document it does not control the
+        origin of, defeating the origin/path reasoning of steps 2 and 3.
+        """
+        r = self.http.get(url, timeout=self.timeout, allow_redirects=False,
+                          headers={"Accept": "application/json"})
+        if 300 <= r.status_code < 400:
+            raise SecurityError("%s at %s redirected (%d -> %s); refusing to follow redirects"
+                                % (what, url, r.status_code, r.headers.get("Location", "?")))
+        if r.status_code != 200:
+            raise SecurityError("%s at %s returned HTTP %d" % (what, url, r.status_code))
+        try:
+            doc = r.json()
+        except ValueError:
+            raise SecurityError("%s at %s is not valid JSON" % (what, url))
+        if not isinstance(doc, dict):
+            raise SecurityError("%s at %s is not a JSON object" % (what, url))
+        return doc
 
     def _post_json(self, url: str, body: dict) -> dict:
         """POST a JSON body (used for dynamic client registration)."""
-        r = self.http.post(url, json=body, timeout=self.timeout)
-        r.raise_for_status()
+        r = self.http.post(url, json=body, timeout=self.timeout, allow_redirects=False)
+        if r.status_code >= 300:
+            raise SecurityError("POST %s -> %d: %s" % (url, r.status_code, r.text[:300]))
         return r.json()
 
     def _post_form(self, url: str, form: dict) -> dict:
         """POST a form-encoded body (used for the OAuth token/device endpoints).
 
         OAuth endpoints expect application/x-www-form-urlencoded. We surface a
-        400+ as a SecurityError with a trimmed body so failures are legible.
+        3xx/4xx/5xx as a SecurityError with a trimmed body so failures are legible.
         """
-        r = self.http.post(url, data=form, timeout=self.timeout)
-        if r.status_code >= 400:
+        r = self.http.post(url, data=form, timeout=self.timeout, allow_redirects=False)
+        if r.status_code >= 300:
             raise SecurityError("POST %s -> %d: %s" % (url, r.status_code, r.text[:300]))
         return r.json()
 
@@ -640,10 +756,15 @@ class AuthVoClient:
 def main(argv: list[str]) -> int:
     """CLI entry point: take a resource URL (arg or AUTHVO_RESOURCE) and run it.
 
+    Exit status: 0 = the resource returned 200; 1 = a check failed, the network
+    failed, or the resource answered with anything else; 2 = usage error.
+
     Environment variables:
-      AUTHVO_RESOURCE      the protected-resource URL (if not passed as argv[1])
-      AUTHVO_CLIENT_ID     a preconfigured client_id (skips dynamic registration)
-      AUTHVO_OPEN_BROWSER  "1" to auto-open the device verification URL
+      AUTHVO_RESOURCE        the protected-resource URL (if not passed as argv[1])
+      AUTHVO_CLIENT_ID       a preconfigured client_id (skips dynamic registration)
+      AUTHVO_OPEN_BROWSER    "1" to auto-open the device verification URL
+      AUTHVO_TOKEN_EXCHANGE  "1" to ALSO run the RFC 8693 token exchange (off by
+                             default; needs a client the IAM lets use that grant)
     """
     # Log as plain lines so the STEP trace reads as a clean narrative.
     logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -656,16 +777,24 @@ def main(argv: list[str]) -> int:
     client = AuthVoClient(
         client_id=os.environ.get("AUTHVO_CLIENT_ID"),
         open_browser=os.environ.get("AUTHVO_OPEN_BROWSER") == "1",
+        token_exchange=os.environ.get("AUTHVO_TOKEN_EXCHANGE") == "1",
     )
     try:
         resp = client.access(resource)
     except SecurityError as e:
-        # Any failed gate / check lands here: print why and exit non-zero.
+        # Any failed check lands here: print why and exit non-zero.
         log.error("ABORT: %s", e)
+        return 1
+    except requests.RequestException as e:
+        # Network trouble (DNS, TLS, timeout) is not a security verdict, but we
+        # still stop and send nothing.
+        log.error("ERROR: network failure: %s", e)
         return 1
     print("\n--- resource response ---")
     print(resp.text[:2000])
-    return 0
+    # Exit non-zero unless the resource actually handed over its data (a 403 for
+    # a missing scope, say, is a failure even though no check was violated).
+    return 0 if resp.status_code == 200 else 1
 
 
 if __name__ == "__main__":

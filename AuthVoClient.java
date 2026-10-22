@@ -20,7 +20,7 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 
 /**
- * Reference VO client for the unified AuthVO bearer-token flow (Java port).
+ * Reference VO client for the AuthVO bearer-token flow (Java port; RFC 9728-conformant).
  * <p>
  * This is the Java twin of {@code authvo_client.py}; it implements exactly the
  * same flow and the same security checks, and is written to be read.
@@ -28,45 +28,57 @@ import java.util.regex.Pattern;
  * <h2>Why this exists (the threat it defends against)</h2>
  * In plain OAuth2, a protected service that returns "go get a token from issuer
  * X" does not prove that issuer X is really tied to that service. A malicious
- * service (the "evil service") can point a client at a spoofed metadata document
- * and harvest a real token minted for it. AuthVO closes that hole with two ideas
- * implemented below:
+ * service (the "evil service") can name a REAL issuer and harvest a real token
+ * the user was tricked into obtaining for it. AuthVO closes that hole with two
+ * independent checks:
  * <ol>
- *   <li>The 401 returns ONLY a <em>pointer</em> to a metadata document (the
- *       "sidecar"), never the authoritative descriptor. The pointer is
- *       UNTRUSTED until it passes the domain-proxy check.</li>
- *   <li>The DOMAIN-PROXY CHECK (step 4) trusts the named issuer only if (a) the
- *       document is served from the SAME origin as that issuer, and (b) the
- *       resource we actually called is one the document is authoritative for.</li>
+ *   <li><b>Step 2 - the PRM.</b> The resource server publishes Protected Resource
+ *       Metadata (RFC 9728) at ITS OWN well-known URL; the 401 only POINTS at it,
+ *       and the pointer is UNTRUSTED. The PRM's {@code resource} must COVER the
+ *       URL we asked for.</li>
+ *   <li><b>Step 3 - the resource check.</b> A resource server can claim any issuer,
+ *       so the binding is verified from the other side: the AUTHORIZATION
+ *       SERVER's own RFC 8414 metadata must (a) carry the very issuer the PRM
+ *       named and (b) list the requested resource in {@code protected_resources}
+ *       (RFC 9728 section 4). An issuer that publishes no list is refused: absence
+ *       is a failure, not a pass. All of this happens BEFORE any user login.</li>
  * </ol>
- * The token we ultimately obtain is bound (its {@code aud} claim) to exactly the
- * target resource, so a leaked token cannot be replayed against another service.
+ * The token request then carries the matched resource as an RFC 8707
+ * {@code resource} indicator so a cooperating issuer can bind the token's
+ * audience to it. (RFC 8693 token exchange can narrow it further -- OPTIONAL, off by
+ * default; enable it with the constructor flag or AUTHVO_TOKEN_EXCHANGE=1.)
  *
- * <h2>The flow (step numbers match the IVOA "Bearer Tokens — open issues" deck
- * and the {@code stepN*} methods below)</h2>
+ * <h2>The flow (step numbers match the {@code stepN*} methods below)</h2>
  * <pre>
- *   1  GET the protected resource anonymously
- *   2  401 "token not found" -> sidecar location (an UNTRUSTED pointer)
- *   3  GET the sidecar at the IAM proxy -> issuer URL + protected-resources list
- *   4  DOMAIN PROXY CHECK (two gates, ABORT on failure):
- *        (a) the sidecar and the issuer it names share the same origin/proxy
- *        (b) the redirecting service is in the sidecar's list (path-prefix match)
- *   5  GET the Authorization Server metadata (RFC 8414) from the named issuer
- *   6  Dynamic client registration (RFC 7591) -> client_id        [if needed]
- *   7  Device authorization request (RFC 8628)
- *   8  User authenticates and grants (we show the service + issuer)
- *   9  Poll the token endpoint (RFC 8628) with resource indicator (RFC 8707)
- *  10  Token exchange (RFC 8693): audience=&lt;resource&gt; -> narrowed token
- *  11  Access the resource with the narrowed token (RS verifies aud server-side)
+ *   1  GET the protected resource anonymously (NO redirects). Expect
+ *      401 + WWW-Authenticate: Bearer resource_metadata="..."   (UNTRUSTED pointer)
+ *   2  GET the PRM at that pointer over HTTPS (NO redirects). ABORT unless the PRM
+ *      resource covers the requested URL.                        (RFC 9728 3, 3.3)
+ *   3  RESOURCE CHECK (ABORT before any login on failure): for an issuer named in
+ *      the PRM, GET its RFC 8414 metadata (NO redirects) and require
+ *        (a) metadata issuer == the issuer the PRM named          (RFC 8414 3.3)
+ *        (b) protected_resources present AND covering our URL     (RFC 9728 4)
+ *      The first listed issuer that passes both is used.
+ *   4  Client registration: preconfigured client_id, else RFC 7591 DCR.
+ *   5  Token: device authorization (RFC 8628) -> user logs in (we show the
+ *      resource AND the issuer) -> poll the token endpoint with
+ *      resource=&lt;matched resource id&gt; (RFC 8707). Optional RFC 8693 exchange.
+ *   6  Present the token; the RS validates signature, iss, scope, expiry and aud
+ *      when present.
+ *   7  (refresh would re-send the same resource; not implemented here)
  * </pre>
- * The token requested in steps 9-10 is bound to the service-level resource id
- * that matched in gate (b), not to the dynamic deep URL the client started from.
+ * "Covered" means: equal to the identifier, or the same scheme, host and port
+ * with a path that extends it at a path-SEGMENT boundary. So
+ * {@code https://h/vo} covers {@code https://h/vo/tap/async/1} but not
+ * {@code https://h/vocab}; a root identifier covers its whole origin.
  *
  * <p>Build/run: see pom.xml and README.md (depends on Jackson, JDK 11+).
  */
 public class AuthVoClient {
 
-    // Well-known discovery paths (RFC 8414 and OIDC) tried by step 5.
+    // Well-known discovery paths: step 3 runs on the RFC 8414 document; OIDC
+    // discovery is only ever a fallback for READING ENDPOINTS, never a way
+    // around check (b).
     private static final String WK_AS = "/.well-known/oauth-authorization-server";
     private static final String WK_OIDC = "/.well-known/openid-configuration";
     // OAuth grant-type / token-type URNs used on the wire (spelled out so the
@@ -74,31 +86,47 @@ public class AuthVoClient {
     private static final String GRANT_DEVICE = "urn:ietf:params:oauth:grant-type:device_code";
     private static final String GRANT_EXCHANGE = "urn:ietf:params:oauth:grant-type:token-exchange";
     private static final String TOKEN_TYPE_ACCESS = "urn:ietf:params:oauth:token-type:access_token";
-    // Pulls the sidecar URL out of:  Bearer resource_metadata="https://..."
-    private static final Pattern RES_META =
+    // Pulls the PRM pointer out of:  Bearer resource_metadata="https://..."
+    private static final Pattern RES_META_QUOTED =
             Pattern.compile("resource_metadata\\s*=\\s*\"([^\"]+)\"");
+    private static final Pattern RES_META_BARE =
+            Pattern.compile("resource_metadata\\s*=\\s*([^,\\s]+)");
 
     // One HttpClient for the whole flow. NEVER follow redirects: a redirect from
-    // the protected resource could itself be a spoofing trick, and we only ever
-    // want to act on an explicit 401 challenge.
-    private final HttpClient http = HttpClient.newBuilder()
-            .followRedirects(HttpClient.Redirect.NEVER)
-            .connectTimeout(Duration.ofSeconds(30)).build();
+    // the resource or from a metadata endpoint could itself be a spoofing trick
+    // (and must never carry our bearer token elsewhere).
+    private final HttpClient http;
     private final ObjectMapper json = new ObjectMapper();
 
-    private final String scope;        // requested at the device grant (step 7)
-    private final String exchangeScope; // requested on the narrowed token (step 10)
-    private String clientId;          // may start null and be filled by DCR
+    private final String scope;          // requested at the device grant (step 5)
+    private final String exchangeScope;  // requested on an exchanged token (step 5d)
+    private final boolean tokenExchange; // also run the RFC 8693 exchange (step 5d); off by default
+    private String clientId;             // may start null and be filled by DCR
+    private int lastStatus = -1;         // HTTP status of the final resource call
 
-    /** Convenience: default scopes, optionally a preconfigured client_id. */
+    /** Convenience: default scopes, no token exchange, optionally a preconfigured client_id. */
     public AuthVoClient(String clientId) {
-        this("openid vo.read", "vo.read", clientId);
+        this("openid vo.read", "vo.read", clientId, false);
     }
 
-    public AuthVoClient(String scope, String exchangeScope, String clientId) {
+    public AuthVoClient(String scope, String exchangeScope, String clientId, boolean tokenExchange) {
+        this(scope, exchangeScope, clientId, tokenExchange, defaultHttpClient());
+    }
+
+    /** Package-private: lets the offline tests inject a fake HttpClient. */
+    AuthVoClient(String scope, String exchangeScope, String clientId, boolean tokenExchange,
+                 HttpClient http) {
         this.scope = scope;
         this.exchangeScope = exchangeScope;
         this.clientId = clientId;
+        this.tokenExchange = tokenExchange;
+        this.http = http;
+    }
+
+    private static HttpClient defaultHttpClient() {
+        return HttpClient.newBuilder()
+                .followRedirects(HttpClient.Redirect.NEVER)
+                .connectTimeout(Duration.ofSeconds(30)).build();
     }
 
     /**
@@ -108,6 +136,7 @@ public class AuthVoClient {
      * about discovery or the issuer looks wrong, we throw and send no token.
      */
     public static class SecurityException extends RuntimeException {
+        private static final long serialVersionUID = 1L;
         public SecurityException(String m) { super(m); }
     }
 
@@ -117,26 +146,36 @@ public class AuthVoClient {
 
     /**
      * Run the full flow for one resource URL and return the resource body.
-     * Reads top-to-bottom as the 11 steps; any failed check throws
-     * {@link SecurityException} and nothing further happens.
+     * Reads top-to-bottom as the steps of the flow; any failed check throws
+     * {@link SecurityException} and nothing further happens. Steps 1-3 involve
+     * no user interaction and no credentials, so a failed check costs the user
+     * nothing. See {@link #getLastStatus()} for the final HTTP status.
      */
     public String access(String resourceUrl) throws Exception {
+        ResourceCheck check = discover(resourceUrl);                              // 1-3
+        AsMetadata meta = check.meta;
+        String resourceId = check.resourceId;   // the token is for THIS, not the deep URL
+        String cid = step4Register(meta);                                         // 4
+        JsonNode device = step5aDeviceAuthorization(meta, cid);                   // 5
+        step5bPromptUser(device, resourceUrl, meta.issuer, resourceId);
+        JsonNode token = step5cPollToken(meta, cid, device, resourceId);
+        if (tokenExchange) token = step5dTokenExchange(meta, cid, token, resourceId);
+        return step6Access(resourceUrl, token);                                   // 6
+    }
+
+    /** HTTP status of the resource's final answer (-1 if the flow never got there). */
+    public int getLastStatus() { return lastStatus; }
+
+    /**
+     * Steps 1-3: everything that happens BEFORE the user is involved. Package-
+     * private so tests can drive the discovery half on its own.
+     */
+    ResourceCheck discover(String resourceUrl) throws Exception {
         // The resource itself must be HTTPS before we even knock on its door.
         requireHttps(resourceUrl, "Protected resource");
-
-        String challenge = step1Probe(resourceUrl);                         // 1 + 2
-        String sidecarUrl = step2Pointer(challenge);                        // 2
-        Sidecar sidecar = step3FetchSidecar(sidecarUrl);                    // 3
-        // step 4 returns the service-level resource id our URL matched; the
-        // token is bound to THAT id, not to the deep URL we started from.
-        String resourceId = step4DomainProxyCheck(resourceUrl, sidecarUrl, sidecar);
-        AsMetadata meta = step5AsMetadata(sidecar.issuer);                  // 5
-        String cid = step6Register(meta);                                   // 6
-        JsonNode device = step7DeviceAuthorization(meta, cid);              // 7
-        step8PromptUser(device, resourceUrl, sidecar.issuer);              // 8
-        JsonNode token = step9PollToken(meta, cid, device, resourceId);     // 9
-        JsonNode narrowed = step10TokenExchange(meta, cid, token, resourceId); // 10
-        return step11Access(resourceUrl, narrowed);                         // 11
+        String pointer = step1Probe(resourceUrl);                                 // 1
+        Prm prm = step2Prm(resourceUrl, pointer);                                 // 2
+        return step3ResourceCheck(resourceUrl, prm);                              // 3
     }
 
     // ----------------------------------------------------------------- //
@@ -144,157 +183,198 @@ public class AuthVoClient {
     // ----------------------------------------------------------------- //
 
     /**
-     * Step 1+2: knock anonymously and require a 401 carrying a discovery pointer.
+     * Step 1: knock anonymously; return the PRM pointer from the 401 challenge.
      * A real client begins knowing only the resource URL; we send no token and,
      * because the HttpClient never follows redirects, accept only a 401 whose
-     * WWW-Authenticate header we can parse next.
+     * WWW-Authenticate carries a {@code resource_metadata} pointer (RFC 9728
+     * section 5). The pointer is UNTRUSTED: step 2 decides whether to believe it.
      */
     private String step1Probe(String resourceUrl) throws Exception {
-        log("STEP 1  GET %s  (anonymous)", resourceUrl);
+        log("STEP 1  GET %s  (anonymous, no redirects)", resourceUrl);
         HttpResponse<String> r = send(HttpRequest.newBuilder(URI.create(resourceUrl)).GET());
         if (r.statusCode() != 401)
             throw new SecurityException("Expected 401 with a discovery pointer, got " + r.statusCode());
         String www = r.headers().firstValue("WWW-Authenticate").orElse("");
-        log("STEP 2  401  WWW-Authenticate: %s", www.isEmpty() ? "(missing)" : www);
-        return www;
+        log("        401  WWW-Authenticate: %s", www.isEmpty() ? "(missing)" : www);
+        String pointer = parseResourceMetadata(www);
+        log("        -> PRM pointer (untrusted): %s", pointer);
+        return pointer;
     }
 
-    /**
-     * Step 2: extract the sidecar URL from the challenge. UNTRUSTED at this point
-     * -- it merely tells us where to look; step 4 decides whether to believe it.
-     */
-    private String step2Pointer(String wwwAuthenticate) {
-        Matcher m = RES_META.matcher(wwwAuthenticate);
-        if (!m.find())
-            throw new SecurityException("401 did not carry a resource_metadata pointer");
-        String url = m.group(1);
-        log("        -> sidecar pointer (untrusted): %s", url);
-        return url;
-    }
-
-    /**
-     * Step 3: fetch and parse the RFC 9728 descriptor. It names the issuer (AS)
-     * and the resource ids it is authoritative for. Still untrusted until step 4.
-     */
-    private Sidecar step3FetchSidecar(String sidecarUrl) throws Exception {
-        requireHttps(sidecarUrl, "Sidecar (protected-resource metadata)");
-        log("STEP 3  GET sidecar %s", sidecarUrl);
-        JsonNode doc = getJson(sidecarUrl);
-
-        // authorization_servers is required; we use the first issuer named.
-        JsonNode servers = doc.get("authorization_servers");
-        if (servers == null || !servers.isArray() || servers.isEmpty())
-            throw new SecurityException("sidecar did not list any authorization_servers");
-        String issuer = servers.get(0).asText();
-
-        // protected_resources is the IVOA allow-list extension; fall back to the
-        // single standard `resource` value when it is absent.
-        List<String> listed = new ArrayList<>();
-        JsonNode pr = doc.get("protected_resources");
-        if (pr != null && pr.isArray()) {
-            for (JsonNode n : pr) listed.add(n.asText());
-        } else if (doc.hasNonNull("resource")) {     // standard RFC 9728 fallback
-            listed.add(doc.get("resource").asText());
+    /** Extract the {@code resource_metadata} URL (quoted or bare form) from a Bearer challenge. */
+    static String parseResourceMetadata(String wwwAuthenticate) {
+        Matcher m = RES_META_QUOTED.matcher(wwwAuthenticate);
+        if (!m.find()) {
+            m = RES_META_BARE.matcher(wwwAuthenticate);
+            if (!m.find())
+                throw new SecurityException("401 did not carry a resource_metadata pointer");
         }
-        log("        issuer=%s  protected_resources=%s", issuer, listed);
-        return new Sidecar(sidecarUrl, issuer, listed);
+        return m.group(1);
     }
 
     /**
-     * Step 4: THE security crux. Two gates; either failing aborts everything.
-     * Returns the resource id (from the sidecar's list) our URL matched -- that
-     * id is what the token is requested and bound for.
+     * Step 2: fetch the PRM and require that it describes the resource we asked for.
+     * RFC 9728 section 3: the PRM is a JSON document published BY THE RESOURCE SERVER;
+     * we fetch it over HTTPS, refusing redirects. Per section 3.3 the {@code resource}
+     * it declares must be consistent with the resource being accessed -- here it must
+     * COVER the requested URL ({@link #isCovered}). A PRM about some other resource is
+     * useless to us and a sign of spoofing, so we abort.
      */
-    private String step4DomainProxyCheck(String resourceUrl, String sidecarUrl, Sidecar sc) {
-        log("STEP 4  DOMAIN PROXY CHECK");
+    private Prm step2Prm(String resourceUrl, String pointer) throws Exception {
+        requireHttps(pointer, "PRM pointer");
+        log("STEP 2  GET PRM %s  (no redirects)", pointer);
+        JsonNode doc = getJson(pointer, "Protected Resource Metadata");
 
-        // Gate (a): the sidecar and the issuer it names must share the origin.
-        // A forged descriptor on evil.com cannot satisfy this -- it would have to
-        // be served from the real issuer's own origin.
-        if (!sameOrigin(sidecarUrl, sc.issuer))
-            throw new SecurityException("GATE (a) FAILED: sidecar origin " + origin(sidecarUrl)
-                    + " != issuer origin " + origin(sc.issuer));
-        log("        gate (a) OK: sidecar & issuer share origin %s", origin(sc.issuer));
+        String resource = text(doc, "resource");
+        if (resource == null || resource.isEmpty())
+            throw new SecurityException("PRM has no `resource` member");
+        requireHttps(resource, "PRM resource identifier");
+        List<String> servers = stringList(doc.get("authorization_servers"));
+        if (servers == null || servers.isEmpty())
+            throw new SecurityException("PRM did not list any authorization_servers");
+        log("        resource=%s  authorization_servers=%s", resource, servers);
 
-        // Gate (b): the descriptor must actually claim authority over the
-        // resource we called -- not merely be a valid descriptor for some other.
-        String matched = null;
-        for (String rid : sc.protectedResources) {
-            if (isUnder(resourceUrl, rid)) { matched = rid; break; }
+        if (!isCovered(resourceUrl, resource))
+            throw new SecurityException("STEP 2 FAILED: the PRM's resource " + resource
+                    + " does not cover the requested URL " + resourceUrl);
+        log("        OK: PRM resource covers the requested URL");
+        return new Prm(pointer, resource, servers);
+    }
+
+    /**
+     * Step 3: THE security crux -- ask the ISSUER whether it really serves this resource.
+     * The PRM came from the resource server, which can claim any issuer it likes, so for
+     * each issuer it names we fetch THAT ISSUER's own RFC 8414 metadata and require,
+     * before any user login: (a) metadata {@code issuer} equals the issuer the PRM named
+     * (RFC 8414 3.3), and (b) {@code protected_resources} is present and one entry covers
+     * our URL (RFC 9728 4). The first issuer that passes both is used; if none does we
+     * abort with every reason. An ABSENT {@code protected_resources} is a failure.
+     */
+    private ResourceCheck step3ResourceCheck(String resourceUrl, Prm prm) throws Exception {
+        log("STEP 3  RESOURCE CHECK");
+        List<String> failures = new ArrayList<>();
+        for (String issuer : prm.authorizationServers) {
+            try {
+                ResourceCheck check = checkIssuer(resourceUrl, issuer);
+                log("        issuer %s ACCEPTED", issuer);
+                log("        -> token will be requested for resource id: %s", check.resourceId);
+                return check;
+            } catch (SecurityException e) {
+                log("        issuer %s REJECTED: %s", issuer, e.getMessage());
+                failures.add(issuer + ": " + e.getMessage());
+            }
         }
-        if (matched == null)
-            throw new SecurityException("GATE (b) FAILED: " + resourceUrl
-                    + " is not covered by any listed resource " + sc.protectedResources);
-        log("        gate (b) OK: %s is under listed resource %s", resourceUrl, matched);
-        log("        -> token will be requested for resource id: %s", matched);
-        return matched;
+        throw new SecurityException("STEP 3 FAILED: no authorization server vouches for "
+                + resourceUrl + " (" + String.join("; ", failures) + ")");
     }
 
-    /**
-     * Step 5: discover the trusted issuer's endpoints (RFC 8414, then OIDC).
-     * We also verify the document's own `issuer` equals the issuer we asked for;
-     * a mismatch means the metadata is not really this issuer's, so we abort.
-     */
-    private AsMetadata step5AsMetadata(String issuer) throws Exception {
+    /** Run checks (a) and (b) against ONE issuer, then read its endpoints. */
+    private ResourceCheck checkIssuer(String resourceUrl, String issuer) throws Exception {
         requireHttps(issuer, "Issuer");
-        for (String url : asMetadataUrls(issuer)) {
-            HttpResponse<String> r = send(HttpRequest.newBuilder(URI.create(url)).GET());
-            if (r.statusCode() != 200) continue;   // this variant 404'd; try next
-            log("STEP 5  GET AS metadata %s", url);
-            JsonNode doc = json.readTree(r.body());
-            if (!issuer.equals(doc.path("issuer").asText(null)))
-                throw new SecurityException("AS metadata issuer "
-                        + doc.path("issuer").asText() + " != expected " + issuer);
-            return new AsMetadata(issuer,
-                    doc.get("token_endpoint").asText(),
-                    doc.get("device_authorization_endpoint").asText(),
-                    doc.path("registration_endpoint").asText(null));
-        }
-        throw new SecurityException("could not retrieve AS metadata for " + issuer);
+        String[] urls = asMetadataUrls(issuer);           // {RFC 8414, OIDC}
+        log("        GET AS metadata %s  (RFC 8414, no redirects)", urls[0]);
+        JsonNode doc = getJson(urls[0], "RFC 8414 metadata");
+
+        // (a) The document must really be this issuer's. RFC 8414 3.3: the issuer
+        // value MUST be identical to the one used to build the metadata URL.
+        String docIssuer = text(doc, "issuer");
+        if (!issuer.equals(docIssuer))
+            throw new SecurityException("check (a): metadata issuer '" + docIssuer
+                    + "' != the issuer '" + issuer + "' named by the PRM");
+        log("        check (a) OK: metadata issuer == %s", issuer);
+
+        // (b) The issuer must list the resource. An absent list is a failure.
+        JsonNode pr = doc.get("protected_resources");
+        if (pr == null || pr.isNull())
+            throw new SecurityException("check (b): the issuer publishes no protected_resources "
+                    + "(an absent list is a failure)");
+        List<String> listed = stringList(pr);
+        if (listed == null)
+            throw new SecurityException("check (b): protected_resources is not a list of strings");
+        String matched = mostSpecificCover(resourceUrl, listed);
+        if (matched == null)
+            throw new SecurityException("check (b): " + resourceUrl
+                    + " is not covered by the issuer's protected_resources " + listed);
+        log("        check (b) OK: %s is covered by listed resource %s", resourceUrl, matched);
+
+        return new ResourceCheck(endpoints(doc, issuer, urls[1]), matched);
     }
 
     /**
-     * Build the two candidate metadata URLs. Note WHERE the well-known suffix
-     * goes when the issuer has a path (e.g. https://host/iam):
-     *   RFC 8414 inserts it between host and path; OIDC appends it after the path.
+     * Read the endpoints we need from the (already vetted) RFC 8414 document. If it
+     * lacks one, fall back to the OIDC discovery document -- but ONLY to read
+     * endpoints (its issuer must match too); it never substitutes for the checks.
      */
-    private static List<String> asMetadataUrls(String issuer) {
+    private AsMetadata endpoints(JsonNode doc, String issuer, String oidcUrl) throws Exception {
+        List<String> needed = new ArrayList<>(List.of("token_endpoint", "device_authorization_endpoint"));
+        if (clientId == null) needed.add("registration_endpoint");
+        boolean missing = false;
+        for (String k : needed) if (isBlank(text(doc, k))) missing = true;
+        JsonNode oidc = null;
+        if (missing) {
+            log("        endpoints missing from the RFC 8414 document; reading OIDC discovery %s "
+                    + "(endpoints only)", oidcUrl);
+            oidc = getJson(oidcUrl, "OIDC discovery");
+            if (!issuer.equals(text(oidc, "issuer")))
+                throw new SecurityException("OIDC discovery issuer '" + text(oidc, "issuer")
+                        + "' != '" + issuer + "'");
+        }
+        String token = pick(doc, oidc, "token_endpoint");
+        String device = pick(doc, oidc, "device_authorization_endpoint");
+        if (isBlank(token)) throw new SecurityException("the issuer's metadata has no token_endpoint");
+        if (isBlank(device))
+            throw new SecurityException("the issuer's metadata has no device_authorization_endpoint");
+        return new AsMetadata(issuer, token, device, pick(doc, oidc, "registration_endpoint"));
+    }
+
+    /** The value from the primary document, else from the fallback (may be null). */
+    private static String pick(JsonNode primary, JsonNode fallback, String key) {
+        String v = text(primary, key);
+        if (!isBlank(v)) return v;
+        return fallback == null ? null : text(fallback, key);
+    }
+
+    /**
+     * Build the (RFC 8414, OIDC) metadata URLs. Note WHERE the well-known suffix goes
+     * when the issuer has a path (e.g. https://host/iam): RFC 8414 inserts it between
+     * host and path; OIDC appends it after the path.
+     */
+    static String[] asMetadataUrls(String issuer) {
         URI u = URI.create(issuer);
         String base = stripTrailingSlash(u.getRawPath() == null ? "" : u.getRawPath());
         String authority = u.getScheme() + "://" + u.getAuthority();
-        List<String> urls = new ArrayList<>();
-        urls.add(authority + WK_AS + base);   // RFC 8414: insert between host and path
-        urls.add(authority + base + WK_OIDC); // OIDC: append after the issuer path
-        return urls;
+        return new String[] {authority + WK_AS + base, authority + base + WK_OIDC};
     }
 
     /**
-     * Step 6: obtain a client_id -- reuse a preconfigured one, else self-register
-     * (RFC 7591) as a PUBLIC client (no secret) declaring the device_code and
-     * token-exchange grants.
-     * <p>NB: some IAMs (e.g. INDIGO) forbid self-registered clients from
-     * requesting token-exchange. Against those, pass a preconfigured client_id,
-     * or bind the audience via the device-grant `aud` parameter instead.
+     * Step 4: obtain a client_id -- reuse a preconfigured one, else self-register
+     * (RFC 7591) as a PUBLIC client (no secret) declaring the device_code grant, plus
+     * token-exchange only if we will actually use it.
+     * <p>NB: some IAMs (e.g. INDIGO) forbid self-registered clients from requesting
+     * token-exchange. Against those leave token exchange off (it is optional) or pass
+     * a preconfigured client_id.
      */
-    private String step6Register(AsMetadata meta) throws Exception {
+    private String step4Register(AsMetadata meta) throws Exception {
         if (clientId != null) {
-            log("STEP 6  using preconfigured client_id=%s", clientId);
+            log("STEP 4  using preconfigured client_id=%s", clientId);
             return clientId;
         }
         if (meta.registrationEndpoint == null)
             throw new SecurityException("no client_id and the IAM offers no registration endpoint");
-        log("STEP 6  POST register (RFC 7591) %s", meta.registrationEndpoint);
+        log("STEP 4  POST register (RFC 7591) %s", meta.registrationEndpoint);
         // Minimal RFC 7591 registration body, built by hand to avoid pulling in a
-        // JSON writer for four fields.
+        // JSON writer for a handful of fields.
+        String grants = "\"" + GRANT_DEVICE + "\"" + (tokenExchange ? ",\"" + GRANT_EXCHANGE + "\"" : "");
         String body = "{"
                 + "\"client_name\":\"authvo-reference-client\","
-                + "\"grant_types\":[\"" + GRANT_DEVICE + "\",\"" + GRANT_EXCHANGE + "\"],"
+                + "\"grant_types\":[" + grants + "],"
                 + "\"token_endpoint_auth_method\":\"none\","
-                + "\"application_type\":\"native\"}";
+                + "\"application_type\":\"native\","
+                + "\"scope\":\"" + scope + "\"}";
         HttpResponse<String> r = send(HttpRequest.newBuilder(URI.create(meta.registrationEndpoint))
                 .header("Content-Type", "application/json")
                 .POST(HttpRequest.BodyPublishers.ofString(body)));
-        if (r.statusCode() >= 400)
+        if (r.statusCode() >= 300)
             throw new SecurityException("registration failed " + r.statusCode() + ": " + r.body());
         clientId = json.readTree(r.body()).get("client_id").asText();
         log("        -> client_id=%s", clientId);
@@ -302,12 +382,12 @@ public class AuthVoClient {
     }
 
     /**
-     * Step 7: start the Device Authorization Grant (RFC 8628). The response holds
-     * a device_code (we poll with) plus a user_code + URL (the human uses). Suits
+     * Step 5a: start the Device Authorization Grant (RFC 8628). The response holds a
+     * device_code (we poll with) plus a user_code + URL (the human uses). Suits
      * CLIs/headless clients: the user authenticates in a browser, not in-process.
      */
-    private JsonNode step7DeviceAuthorization(AsMetadata meta, String cid) throws Exception {
-        log("STEP 7  POST device_authorization (RFC 8628)");
+    private JsonNode step5aDeviceAuthorization(AsMetadata meta, String cid) throws Exception {
+        log("STEP 5  POST device_authorization (RFC 8628)");
         Map<String, String> form = new LinkedHashMap<>();
         form.put("client_id", cid);
         form.put("scope", scope);
@@ -318,17 +398,20 @@ public class AuthVoClient {
     }
 
     /**
-     * Step 8: tell the human where to go and what they are authorizing. We show
-     * both the resource and the identity provider so they can sanity-check the
-     * IAM/service before logging in. The client never sees their credentials.
+     * Step 5b: tell the human where to go and what they are authorizing. We show the
+     * resource, the resource id the token is for, AND the identity provider so they can
+     * sanity-check the IAM/service before logging in. The client never sees their
+     * credentials.
      */
-    private void step8PromptUser(JsonNode device, String resourceUrl, String issuer) {
+    private void step5bPromptUser(JsonNode device, String resourceUrl, String issuer,
+                                  String resourceId) {
         // verification_uri_complete embeds the user_code; prefer it when present.
         String uri = device.path("verification_uri_complete")
                 .asText(device.path("verification_uri").asText(""));
-        log("STEP 8  user action required");
+        log("        user action required");
         System.out.println("\n" + "=".repeat(64));
         System.out.println("  Authorize access to : " + resourceUrl);
+        System.out.println("  Token is for        : " + resourceId);
         System.out.println("  Identity provider   : " + issuer);
         System.out.println("  Open                : " + uri);
         // Only print the code separately if it is not already in the URL.
@@ -338,17 +421,19 @@ public class AuthVoClient {
     }
 
     /**
-     * Step 9: poll the token endpoint until the user approves (or we time out).
-     * Per RFC 8628 we wait `interval` seconds between polls and handle two
-     * non-error signals: authorization_pending (keep waiting) and slow_down (back
-     * off 5s). The RFC 8707 `resource` indicator lets a cooperating IAM already
-     * scope the broad token toward the target.
+     * Step 5c: poll the token endpoint until the user approves (or we time out). Per
+     * RFC 8628 we wait `interval` seconds between polls and handle two non-error
+     * signals: authorization_pending (keep waiting) and slow_down (back off 5s). Every
+     * poll carries the RFC 8707 {@code resource} indicator -- the id that matched in
+     * step 3(b) -- so a cooperating issuer can bind the audience to exactly that
+     * resource. If the token is a JWT we log its aud for information only: the resource
+     * server, not we, enforces it.
      */
-    private JsonNode step9PollToken(AsMetadata meta, String cid, JsonNode device,
-                                    String resourceId) throws Exception {
+    private JsonNode step5cPollToken(AsMetadata meta, String cid, JsonNode device,
+                                     String resourceId) throws Exception {
         int interval = device.path("interval").asInt(5);
         Instant deadline = Instant.now().plusSeconds(device.path("expires_in").asInt(300));
-        log("STEP 9  polling token endpoint (resource=%s)", resourceId);
+        log("        polling token endpoint (resource=%s)", resourceId);
         while (Instant.now().isBefore(deadline)) {
             Thread.sleep(interval * 1000L);          // RFC 8628: wait before each poll
             Map<String, String> form = new LinkedHashMap<>();
@@ -363,6 +448,7 @@ public class AuthVoClient {
             if (r.statusCode() == 200) {
                 validateIssuer(doc, meta.issuer, "access token");
                 log("        -> access token acquired");
+                logAud(doc, "access token");
                 return doc;
             }
             String err = doc.path("error").asText("");
@@ -376,14 +462,15 @@ public class AuthVoClient {
     }
 
     /**
-     * Step 10: RFC 8693 token exchange -- swap the broad token for one whose
-     * `audience` is the target resource. The result is an aud-bound token that
-     * cannot be replayed against any other service (its aud check would reject
-     * it). We send both `audience` (RFC 8693) and `resource` (RFC 8707).
+     * Step 5d (optional, off by default): RFC 8693 token exchange -- swap the token for
+     * one whose {@code audience} is the target resource, so it cannot be replayed against
+     * any other service. (The {@code resource} indicator in step 5c is the primary
+     * mechanism); this needs a client the IAM allows to use the exchange grant. We send both `audience`
+     * (RFC 8693) and `resource` (RFC 8707).
      */
-    private JsonNode step10TokenExchange(AsMetadata meta, String cid, JsonNode token,
+    private JsonNode step5dTokenExchange(AsMetadata meta, String cid, JsonNode token,
                                          String resourceId) throws Exception {
-        log("STEP 10  token exchange (RFC 8693)  audience=%s", resourceId);
+        log("STEP 5d token exchange (RFC 8693)  audience=%s", resourceId);
         Map<String, String> form = new LinkedHashMap<>();
         form.put("grant_type", GRANT_EXCHANGE);
         form.put("client_id", cid);
@@ -393,23 +480,22 @@ public class AuthVoClient {
         form.put("resource", resourceId);              // RFC 8707, belt-and-braces
         form.put("scope", exchangeScope);
         JsonNode doc = postForm(meta.tokenEndpoint, form);
-        validateIssuer(doc, meta.issuer, "narrowed token");
-        // Decode (without verifying) only to log the resulting aud for the trace.
-        Map<String, Object> payload = jwtPayload(doc.path("access_token").asText(""));
-        if (payload != null && payload.containsKey("aud"))
-            log("        -> narrowed token aud=%s", payload.get("aud"));
+        validateIssuer(doc, meta.issuer, "exchanged token");
+        logAud(doc, "exchanged token");
         return doc;
     }
 
     /**
-     * Step 11: retry the original request with the narrowed bearer token. The
-     * resource server independently verifies signature/iss/aud/scope/expiry; we
-     * just present the token and report the outcome.
+     * Step 6: retry the original request with the bearer token. The resource server
+     * independently verifies signature/iss/scope/expiry (and aud when the token has
+     * one); we just present the token and report the outcome. No redirect is followed:
+     * it must never carry our bearer token to a place the resource did not name.
      */
-    private String step11Access(String resourceUrl, JsonNode narrowed) throws Exception {
-        log("STEP 11  GET %s  with narrowed bearer token", resourceUrl);
+    private String step6Access(String resourceUrl, JsonNode token) throws Exception {
+        log("STEP 6  GET %s  with bearer token", resourceUrl);
         HttpResponse<String> r = send(HttpRequest.newBuilder(URI.create(resourceUrl))
-                .header("Authorization", "Bearer " + narrowed.get("access_token").asText()).GET());
+                .header("Authorization", "Bearer " + token.get("access_token").asText()).GET());
+        lastStatus = r.statusCode();
         if (r.statusCode() == 200) log("        -> SUCCESS (%d bytes)", r.body().length());
         else log("        -> resource returned %d", r.statusCode());
         return r.body();
@@ -418,8 +504,10 @@ public class AuthVoClient {
     // ----------------------------------------------------------------- //
     //  security / URL helpers                                           //
     //                                                                   //
-    //  The domain-proxy check is all about comparing ORIGINS and PATHS, //
-    //  so these small helpers are the security-critical core.           //
+    //  Steps 2 and 3 are all about comparing ORIGINS and PATHS, so      //
+    //  these small helpers are the security-critical core. They match   //
+    //  authvo_client.py and both are tested against                     //
+    //  tests/coverage_vectors.json.                                     //
     // ----------------------------------------------------------------- //
 
     /**
@@ -438,27 +526,59 @@ public class AuthVoClient {
         return scheme + "://" + netloc;
     }
 
-    /** True iff two URLs share scheme+host+port. The heart of gate (a). */
+    /** True iff two URLs share scheme+host+port. */
     static boolean sameOrigin(String a, String b) { return origin(a).equals(origin(b)); }
 
     /**
-     * Path-prefix membership at a path-segment boundary, same origin required.
-     * Implements gate (b): a listed {@code /datalink} covers {@code /datalink}
-     * and {@code /datalink/...} but never the unrelated {@code /datalinkX}.
+     * The URL's raw path with dot-segments resolved (RFC 3986 5.2.4) and no trailing
+     * '/'. Resolving "." and ".." (also percent-encoded) matters for security: without
+     * it https://h/vo/../other would look as if it were "under" /vo while the server
+     * would serve /other. The root path comes back as "".
      */
-    static boolean isUnder(String resourceUrl, String listedId) {
-        if (!sameOrigin(resourceUrl, listedId)) return false;   // origin first
-        String rp = pathOrRoot(resourceUrl);
-        String lp = pathOrRoot(listedId);
-        if (lp.equals("/") || lp.isEmpty()) return true;        // root covers all
-        lp = stripTrailingSlash(lp);
-        return rp.equals(lp) || rp.startsWith(lp + "/");        // segment boundary
+    static String normalizedPath(String url) {
+        String p = URI.create(url).getRawPath();
+        if (p == null || p.isEmpty()) p = "/";
+        List<String> out = new ArrayList<>();
+        for (String seg : p.split("/", -1)) {
+            String s = seg.toLowerCase();
+            if (s.equals(".") || s.equals("%2e")) continue;
+            if (s.equals("..") || s.equals(".%2e") || s.equals("%2e.") || s.equals("%2e%2e")) {
+                if (out.size() > 1) out.remove(out.size() - 1);   // keep the leading ""
+                continue;
+            }
+            out.add(seg);
+        }
+        return stripTrailingSlash(String.join("/", out));
     }
 
-    /** A URL's path, or "/" if it has none. */
-    private static String pathOrRoot(String url) {
-        String p = URI.create(url).getPath();
-        return (p == null || p.isEmpty()) ? "/" : p;
+    /**
+     * Is {@code url} covered by the resource identifier {@code resourceId}? Covered means
+     * the same origin and a path equal to the identifier's or extending it AT A
+     * PATH-SEGMENT BOUNDARY (RFC 9728 3.3 compares a resource with the URL it was found
+     * for; AuthVO extends that to deep URLs under one service-level identifier).
+     * {@code https://h} covers every path on that origin; {@code https://h/vo} covers
+     * /vo and /vo/tap/async/1 but NOT /vocab and NOT /vo/../other.
+     */
+    static boolean isCovered(String url, String resourceId) {
+        if (!sameOrigin(url, resourceId)) return false;         // origin first
+        String up = normalizedPath(url), rp = normalizedPath(resourceId);
+        if (rp.isEmpty()) return true;                          // root covers the whole origin
+        return up.equals(rp) || up.startsWith(rp + "/");        // segment boundary
+    }
+
+    /**
+     * Of the identifiers that cover {@code url}, the most specific (longest path); ties
+     * keep list order; null if none covers it. If an issuer lists both https://h and
+     * https://h/vo, a request under /vo gets a token for the narrower one.
+     */
+    static String mostSpecificCover(String url, List<String> resourceIds) {
+        String best = null;
+        for (String r : resourceIds) {
+            if (isCovered(url, r)
+                    && (best == null || normalizedPath(r).length() > normalizedPath(best).length()))
+                best = r;
+        }
+        return best;
     }
 
     private static String stripTrailingSlash(String s) {
@@ -473,11 +593,37 @@ public class AuthVoClient {
             throw new SecurityException(what + " must be served over HTTPS: " + url);
     }
 
+    /** A JSON string member, or null if absent / not a string. */
+    private static String text(JsonNode doc, String key) {
+        JsonNode n = doc == null ? null : doc.get(key);
+        return (n != null && n.isTextual()) ? n.asText() : null;
+    }
+
+    private static boolean isBlank(String s) { return s == null || s.isEmpty(); }
+
+    /** A JSON array of strings as a List, or null if it is not exactly that. */
+    private static List<String> stringList(JsonNode n) {
+        if (n == null || !n.isArray()) return null;
+        List<String> out = new ArrayList<>();
+        for (JsonNode e : n) {
+            if (!e.isTextual()) return null;
+            out.add(e.asText());
+        }
+        return out;
+    }
+
+    /** Log a JWT token's aud for information. Never fails, never decides. */
+    private void logAud(JsonNode doc, String what) {
+        Map<String, Object> payload = jwtPayload(doc.path("access_token").asText(""));
+        if (payload == null) log("        (%s is opaque; aud not inspectable)", what);
+        else log("        %s aud=%s (informational; the resource server enforces it)",
+                what, payload.containsKey("aud") ? payload.get("aud") : "<absent>");
+    }
+
     /**
-     * Client-side issuer cross-check (RFC 9207 spirit): if the token RESPONSE or
-     * the JWT itself names an issuer, it MUST equal the issuer we trusted. This
-     * is a cheap early sanity check; the resource server does the authoritative
-     * binding verification.
+     * Client-side issuer cross-check (RFC 9207 spirit): if the token RESPONSE or the JWT
+     * itself names an issuer, it MUST equal the issuer we trusted. A cheap early sanity
+     * check; the resource server does the authoritative binding verification.
      */
     private void validateIssuer(JsonNode doc, String issuer, String what) {
         String iss = doc.path("iss").asText(null);
@@ -489,10 +635,11 @@ public class AuthVoClient {
     }
 
     /**
-     * Best-effort decode of a JWT payload, with NO signature verification.
-     * Used only to log/sanity-check claims like aud/iss; never for a trust
-     * decision. Returns null for opaque (non-JWT) tokens.
+     * Best-effort decode of a JWT payload, with NO signature verification. Used only to
+     * log/sanity-check claims like aud/iss; never for a trust decision. Returns null for
+     * opaque (non-JWT) tokens.
      */
+    @SuppressWarnings("unchecked")
     private Map<String, Object> jwtPayload(String token) {
         String[] parts = token.split("\\.");
         if (parts.length != 3) return null;             // opaque token
@@ -514,12 +661,32 @@ public class AuthVoClient {
                 HttpResponse.BodyHandlers.ofString());
     }
 
-    /** GET a URL and parse JSON, throwing on any 400+ status. */
-    private JsonNode getJson(String url) throws Exception {
-        HttpResponse<String> r = send(HttpRequest.newBuilder(URI.create(url)).GET());
-        if (r.statusCode() >= 400)
-            throw new SecurityException("GET " + url + " -> " + r.statusCode());
-        return json.readTree(r.body());
+    /**
+     * GET a discovery document and parse JSON -- NEVER following redirects. Fail
+     * closed: a redirect (3xx), any non-200 status, or a body that is not a JSON
+     * object throws SecurityException. Refusing redirects matters because a hostile
+     * server could bounce us to a document whose origin it does not control, defeating
+     * the origin/path reasoning of steps 2 and 3.
+     */
+    private JsonNode getJson(String url, String what) throws Exception {
+        HttpResponse<String> r = send(HttpRequest.newBuilder(URI.create(url))
+                .header("Accept", "application/json").GET());
+        int s = r.statusCode();
+        if (s >= 300 && s < 400)
+            throw new SecurityException(what + " at " + url + " redirected (" + s + " -> "
+                    + r.headers().firstValue("Location").orElse("?")
+                    + "); refusing to follow redirects");
+        if (s != 200)
+            throw new SecurityException(what + " at " + url + " returned HTTP " + s);
+        JsonNode doc;
+        try {
+            doc = json.readTree(r.body());
+        } catch (Exception e) {
+            throw new SecurityException(what + " at " + url + " is not valid JSON");
+        }
+        if (doc == null || !doc.isObject())
+            throw new SecurityException(what + " at " + url + " is not a JSON object");
+        return doc;
     }
 
     /** POST a form-encoded body (the OAuth endpoints expect this), parse JSON. */
@@ -527,7 +694,7 @@ public class AuthVoClient {
         HttpResponse<String> r = send(HttpRequest.newBuilder(URI.create(url))
                 .header("Content-Type", "application/x-www-form-urlencoded")
                 .POST(HttpRequest.BodyPublishers.ofString(encode(form))));
-        if (r.statusCode() >= 400)
+        if (r.statusCode() >= 300)
             throw new SecurityException("POST " + url + " -> " + r.statusCode() + ": " + r.body());
         return json.readTree(r.body());
     }
@@ -550,15 +717,15 @@ public class AuthVoClient {
 
     // ----------------------------------------------------------------- //
     //  small value types                                                //
-    //  (typed holders for the two discovered documents)                 //
+    //  (typed holders for the documents we discover)                    //
     // ----------------------------------------------------------------- //
 
-    /** The parsed RFC 9728 Protected-Resource-Metadata document. */
-    private static final class Sidecar {
-        final String url, issuer;                 // url kept for gate (a)
-        final List<String> protectedResources;    // gate (b) allow-list
-        Sidecar(String url, String issuer, List<String> pr) {
-            this.url = url; this.issuer = issuer; this.protectedResources = pr;
+    /** The parsed RFC 9728 Protected Resource Metadata document. */
+    private static final class Prm {
+        final String url, resource;               // where we fetched it / what it says it is
+        final List<String> authorizationServers;
+        Prm(String url, String resource, List<String> servers) {
+            this.url = url; this.resource = resource; this.authorizationServers = servers;
         }
     }
 
@@ -571,14 +738,28 @@ public class AuthVoClient {
         }
     }
 
+    /** What a passed resource check (step 3) hands to the rest of the flow. */
+    static final class ResourceCheck {
+        final AsMetadata meta;     // the trusted issuer's endpoints
+        final String resourceId;   // the protected_resources entry that covered our URL
+        ResourceCheck(AsMetadata meta, String resourceId) {
+            this.meta = meta; this.resourceId = resourceId;
+        }
+        String issuer() { return meta.issuer; }
+        String tokenEndpoint() { return meta.tokenEndpoint; }
+        String deviceAuthorizationEndpoint() { return meta.deviceAuthorizationEndpoint; }
+    }
+
     // ----------------------------------------------------------------- //
     //  CLI                                                              //
     // ----------------------------------------------------------------- //
 
     /**
      * Entry point: take a resource URL (argv[0] or env AUTHVO_RESOURCE) and run.
-     * Env AUTHVO_CLIENT_ID supplies a preconfigured client_id (skips step 6).
-     * A failed security check prints "ABORT: ..." and exits non-zero.
+     * Env AUTHVO_CLIENT_ID supplies a preconfigured client_id (skips step 4);
+     * AUTHVO_TOKEN_EXCHANGE=1 ALSO runs the RFC 8693 exchange (off by default; needs a
+     * client the IAM lets use that grant). A failed security check prints
+     * "ABORT: ..." and exits 1, as does a resource that does not answer 200.
      */
     public static void main(String[] args) throws Exception {
         String resource = args.length > 0 ? args[0] : System.getenv("AUTHVO_RESOURCE");
@@ -586,13 +767,21 @@ public class AuthVoClient {
             System.err.println("usage: AuthVoClient <protected-resource-url>");
             System.exit(2);
         }
-        AuthVoClient client = new AuthVoClient(System.getenv("AUTHVO_CLIENT_ID"));
+        boolean exchange = "1".equals(System.getenv("AUTHVO_TOKEN_EXCHANGE"));
+        AuthVoClient client = new AuthVoClient("openid vo.read", "vo.read",
+                System.getenv("AUTHVO_CLIENT_ID"), exchange);
         try {
             String body = client.access(resource);
             System.out.println("\n--- resource response ---");
             System.out.println(body.length() > 2000 ? body.substring(0, 2000) : body);
+            if (client.getLastStatus() != 200) System.exit(1);
         } catch (SecurityException e) {
             System.err.println("ABORT: " + e.getMessage());
+            System.exit(1);
+        } catch (java.io.IOException e) {
+            // Network trouble (DNS, TLS, timeout) is not a security verdict, but we
+            // still stop and send nothing.
+            System.err.println("ERROR: network failure: " + e);
             System.exit(1);
         }
     }

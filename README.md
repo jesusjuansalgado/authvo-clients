@@ -7,50 +7,80 @@ as the authorization server.
 
 This repository contains:
 
-* two **reference client implementations** (Python and Java) of the unified
-  AuthVO flow, and
+* two **reference client implementations** (Python and Java) of the AuthVO flow,
+  which follows RFC 9728 (see §13 for what changed with
+  [AuthVO issue #22](https://github.com/ivoa-std/AuthVO/issues/22)), and
 * a **local integration harness** (`test-integration/`) that stands up a real
-  INDIGO IAM, a Protected-Resource-Metadata "sidecar", a single-origin Traefik
-  proxy, and a protected resource server, plus three runnable demo drivers.
+  INDIGO IAM, a metadata *augmenter* that emulates the one thing INDIGO does not
+  yet publish, a single-origin Traefik proxy, a protected resource server, and an
+  "evil" resource server for a negative test, plus runnable demo drivers and a
+  live scenario runner.
 
 ---
 
 ## 1. Background — the problem AuthVO solves
 
 Plain OAuth2 does not tell a client *which* resource server a freshly-issued
-token may be sent to. A malicious resource server (the "evil service") can point
-token discovery at spoofed metadata and capture a real token issued for it.
+token may be sent to. A malicious resource server (the "evil service") can name a
+**real** identity provider in its own metadata and so lure the user into
+obtaining a real token for it, then capture that token.
 
-The AuthVO direction (from the IVOA DSP *Bearer Tokens — Open Issues* deck) is
-**PRM-based discovery + audience-bound tokens**:
+The AuthVO direction (from the IVOA DSP *Bearer Tokens — Open Issues* deck, as
+revised by issue #22) follows [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728):
 
-* The resource server's `401` returns **only a pointer** (`resource_metadata`)
-  to an [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728) Protected-Resource-
-  Metadata (PRM) document — never the authoritative descriptor itself.
-* That PRM (the **sidecar**) is served from the **IAM's own origin**, so the
-  client's **domain-proxy check** (sidecar host == issuer host, and the resource
-  is one the descriptor covers) can distinguish a real binding from a forgery.
-* The client uses the device grant and narrows the token's `aud` to exactly the
-  target resource (via RFC 8693 token exchange **or** an RFC 8707-style `aud`
-  request parameter). The resource server enforces `aud == its own id` plus the
-  `vo.read` scope.
+* The resource server's `401` returns **only a pointer** (`resource_metadata`) to
+  its **own** Protected Resource Metadata (PRM) document, which it publishes at
+  its own well-known URL. The pointer is untrusted; the client only accepts a PRM
+  whose `resource` **covers the URL it asked for**.
+* But a resource server can say anything about itself, including "my issuer is
+  the real IAM". So the binding is checked **from the other side**: the
+  authorization server's own RFC 8414 metadata must name the same issuer **and
+  list the resource in `protected_resources`**
+  ([RFC 9728 §4](https://www.rfc-editor.org/rfc/rfc9728#section-4)). Only the
+  issuer can vouch for which resources it serves. If it publishes no such list
+  the client refuses: **absence is a failure, not a pass.** This *resource check*
+  happens before the user is asked to log in.
+* The client uses the device grant and sends the matched resource as an
+  [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707) `resource` indicator, so a
+  cooperating issuer can bind the token's `aud`. (RFC 8693 token exchange can
+  narrow it further, but is optional and off by default.) The resource server
+  enforces `iss`, `vo.read`, expiry and — whenever the token carries one — `aud`.
 
 ## 2. The flow
 
 ```
- 1  GET the protected resource anonymously
- 2  401 -> WWW-Authenticate: Bearer resource_metadata="<PRM url>"   (UNTRUSTED pointer)
- 3  GET the PRM sidecar  -> issuer URL + protected-resources list
- 4  DOMAIN-PROXY CHECK (abort on failure):
-       (a) the sidecar and the issuer it names share the same origin
-       (b) the resource we hit is covered by the descriptor (path-prefix match)
- 5  GET the Authorization Server metadata (RFC 8414 / OIDC discovery)
- 6  Obtain a client_id (dynamic registration RFC 7591, or preconfigured)
- 7  Device authorization request (RFC 8628)
- 8  User authenticates and approves on the IAM's own login page
- 9  Poll the token endpoint -> access token (aud-bound to the resource)
-10  Access the resource with the token (RS verifies aud/iss/scope/signature)
+ 1  GET the protected resource anonymously (no redirects)
+    -> 401  WWW-Authenticate: Bearer resource_metadata="<PRM url>"   (UNTRUSTED pointer)
+ 2  GET the PRM at that pointer — the resource server's OWN RFC 9728 document —
+    over HTTPS, no redirects.  ABORT unless the PRM `resource` covers the
+    requested URL.
+ 3  RESOURCE CHECK (abort before any login).  For an issuer named in the PRM, GET
+    its RFC 8414 metadata (no redirects) and require
+       (a) metadata `issuer`  ==  the issuer the PRM named
+       (b) `protected_resources` present AND one entry covers the requested URL
+    The first listed issuer that passes both is used.  OIDC discovery is used only
+    to read endpoints, never to skip (b).
+ 4  Obtain a client_id (preconfigured, or dynamic registration RFC 7591)
+ 5  Device authorization (RFC 8628): the user logs in and approves on the IAM's own
+    page (the client shows the resource AND the issuer); poll the token endpoint
+    sending  resource=<matched resource id>  (RFC 8707).
+    [optional, off by default: RFC 8693 token exchange]
+ 6  Access the resource with the token (RS verifies signature/iss/scope/expiry,
+    and aud when present)
+ 7  (refresh would re-send the same `resource` — not implemented in the reference clients)
 ```
+
+**"Covered"** (steps 2 and 3b) means: equal to the identifier, or the same
+scheme, host and port with a path that extends it **at a path-segment
+boundary**. `https://src.local.io/vo` covers `https://src.local.io/vo/tap/async/1`
+but not `https://src.local.io/vocab`; a root identifier (`https://src.local.io`)
+covers its whole origin. Dot-segments are resolved first, so `/vo/../other` is not
+"under" `/vo`. Both clients are tested against the same vectors
+(`test-integration/tests/coverage_vectors.json`).
+
+The token is requested for the identifier that matched in 3(b) — the most
+specific one if several match — not for the dynamic deep URL the client started
+from.
 
 ---
 
@@ -58,23 +88,27 @@ The AuthVO direction (from the IVOA DSP *Bearer Tokens — Open Issues* deck) is
 
 | Path | Role |
 |------|------|
-| `authvo_client.py` | Python reference client (full flow, incl. token exchange) |
-| `AuthVoClient.java` | Java reference client (JDK 11+, Jackson) |
+| `authvo_client.py` | Python reference client (the flow of §2) |
+| `AuthVoClient.java` | Java reference client (JDK 11+, Jackson) — behaves identically |
 | `pom.xml` | Java build |
+| `Demo.java`, `demo.py` | Root-level copies of the simplest demo driver (`demo.py` just runs `test-integration/demo/demo.py`) |
 | `test-integration/` | The runnable Docker harness (everything below lives here) |
 | `test-integration/docker-compose.yml` | The whole stack behind Traefik |
 | `test-integration/setup.sh` | One-shot: certs + keystore + Traefik config, brings it up, provisions |
 | `test-integration/iam/iam.env` | INDIGO IAM configuration |
 | `test-integration/iam/GenKeystore.java` | Generates the IAM JWK signing keystore (pure JDK) |
 | `test-integration/iam/keys/keystore.jwks` | JWT signing key set, generated locally (see §7) |
-| `test-integration/sidecar/prm.json` + `nginx.conf` | The PRM sidecar (see §6) |
+| `test-integration/augmenter/` | **Metadata augmenter** (Python, stdlib): adds `protected_resources` to the IAM's metadata — an interim emulation (see §6) |
+| `test-integration/augmenter/config/protected_resources.json` | The resource identifiers the augmenter publishes |
 | `test-integration/traefik/traefik.yml` | Single-origin proxy + TLS |
-| `test-integration/fake-rs/` | The protected resource server (Flask) |
+| `test-integration/fake-rs/` | The protected resource server (Flask); serves its own PRM; also the "evil" instance |
 | `test-integration/seed/provision.sh` | Provisions the IAM: vo.read scope, login users, authvo-client |
-| `test-integration/demo/demo.py` | Original reference driver (interactive device flow) |
+| `test-integration/demo/demo.py` | Reference driver (interactive device flow) |
 | `test-integration/demo/auto_demo.py` | Non-interactive driver (auto-approves the login) |
 | `test-integration/demo/human_demo.py` | Guided driver (Python): explains and pauses on every step |
-| `test-integration/demo/HumanDemo.java` | Guided driver (Java, JDK-only): same as human_demo.py |
+| `test-integration/demo/Demo.java`, `HumanDemo.java` | The same two drivers in Java (JDK-only, single file) |
+| `test-integration/demo/authvo_checks.py` | The discovery checks shared by the Python demos |
+| `test-integration/tests/` | Offline unit tests and the live scenario runner (see §10) |
 
 ---
 
@@ -86,30 +120,37 @@ flowchart LR
     proxy["Traefik proxy<br/>:443"]
     client -->|TLS| proxy
 
-    subgraph iamOrigin["iam.local.io — one TLS origin"]
-        iam["INDIGO IAM<br/>/token · /devicecode · /jwk · DCR"]
-        sidecar["prm-sidecar (nginx)<br/>/.well-known/oauth-protected-resource"]
+    subgraph iamOrigin["iam.local.io — the authorization server's origin"]
+        aug["metadata augmenter (Python)<br/>/.well-known/oauth-authorization-server<br/>/.well-known/openid-configuration<br/>+ protected_resources (interim)"]
+        iam["INDIGO IAM<br/>everything else: /token · /devicecode · /jwk · DCR"]
+        aug -->|"live metadata"| iam
     end
 
     subgraph srcOrigin["src.local.io"]
-        rs["resource server<br/>(the protected data)"]
+        rs["resource server<br/>the protected data<br/>+ its OWN PRM (RFC 9728)"]
     end
 
+    subgraph evilOrigin["evil.local.io"]
+        evil["evil resource server<br/>names the real IAM,<br/>not in protected_resources"]
+    end
+
+    proxy --> aug
     proxy --> iam
-    proxy --> sidecar
     proxy --> rs
+    proxy --> evil
 ```
 
-> The shared box is the whole point: **IAM and the PRM sidecar answer on the same
-> `iam.local.io` origin**, so the client's domain-proxy check can tie the sidecar
-> back to the issuer. The resource server lives on a separate origin
-> (`src.local.io`); the same Traefik instance fronts all three on `:443`.
-
-* **IAM and the sidecar share the `iam.local.io` origin** — that co-location is
-  the entire point of the domain-proxy check. Split them across hosts and the
-  check becomes vacuous.
-* `iam.local.io` and `src.local.io` both resolve to `127.0.0.1` (via
-  `/etc/hosts`) and are served by the same Traefik instance on `:443`.
+* The **resource server** publishes its own PRM; nothing about the resource lives
+  on the IAM origin any more. What ties `src.local.io` to the IAM is the IAM's
+  `protected_resources` list, which the **augmenter** adds to the two
+  `/.well-known` metadata documents (Traefik sends exactly those paths to it, at
+  higher priority; every other IAM path goes straight to the IAM).
+* The augmenter is an **interim emulation**. INDIGO IAM does not publish
+  `protected_resources` yet and is not modified. To a client the augmented
+  metadata is indistinguishable from native support, so the augmenter (and its
+  Traefik router) can simply be deleted once INDIGO publishes the member.
+* `iam.local.io`, `src.local.io` and `evil.local.io` all resolve to `127.0.0.1`
+  (via `/etc/hosts`) and are served by the same Traefik instance on `:443`.
 
 ---
 
@@ -119,8 +160,11 @@ flowchart LR
 * Add the hostnames to `/etc/hosts` (each on its own line):
 
   ```
-  127.0.0.1  iam.local.io src.local.io
+  127.0.0.1  iam.local.io src.local.io evil.local.io
   ```
+
+  (`evil.local.io` is needed only for the negative test; the scenario runner can
+  work without it, see §10.)
 
 * Trust the generated CA (`test-integration/certs/local-ca.pem`) in your browser
   if you want to use the IAM web UI. On macOS:
@@ -130,7 +174,9 @@ flowchart LR
     -k /Library/Keychains/System.keychain test-integration/certs/local-ca.pem
   ```
 
-* Python 3 with `requests` for the demo drivers.
+* Python 3 with `requests` for the Python client and demo drivers
+  (`REQUESTS_CA_BUNDLE=test-integration/certs/local-ca.pem` makes the client trust
+  the local CA). The Java client needs JDK 11+ and Jackson (see `pom.xml`).
 
 > **Note on the IAM image.** The harness pins
 > `indigoiam/iam-login-service:v1.10.0`. It is an `amd64` image, so it runs under
@@ -140,99 +186,87 @@ flowchart LR
 
 ---
 
-## 6. The PRM sidecar — how to create it
+## 6. The PRM and the metadata augmenter
 
-The **sidecar** is the smallest possible thing: **one static JSON document**
-([RFC 9728](https://www.rfc-editor.org/rfc/rfc9728) Protected Resource Metadata)
-served from the IAM origin. It is *not* an application. It exists so the resource
-server can hand back a bare pointer in its `401`, and the client can fetch the
-authoritative descriptor from a host it can tie back to the issuer.
+Two documents carry the discovery, and **they come from different parties**:
 
-### 6.1 The PRM document (`sidecar/prm.json`)
+| Document | Published by | Says | Checked in |
+|----------|--------------|------|-----------|
+| PRM (RFC 9728) at `https://src.local.io/.well-known/oauth-protected-resource` | the **resource server** | "I am this resource; these issuers sign my tokens" | step 2 |
+| AS metadata (RFC 8414) at `https://iam.local.io/.well-known/oauth-authorization-server` | the **authorization server** | "these are the resources I serve" (`protected_resources`) | step 3 |
+
+### 6.1 The PRM (served by `fake-rs`)
+
+`fake-rs/app.py` builds the PRM from its environment — there is no static file:
 
 ```json
 {
   "resource": "https://src.local.io",
-  "authorization_servers": [
-    "https://iam.local.io/"
-  ],
-  "scopes_supported": [
-    "vo.read"
-  ],
-  "bearer_methods_supported": [
-    "header"
-  ],
-  "resource_documentation": "https://www.ivoa.net/documents/authvo/"
+  "authorization_servers": ["https://iam.local.io/"],
+  "scopes_supported": ["vo.read"],
+  "bearer_methods_supported": ["header"]
 }
 ```
 
-**Field syntax** (RFC 9728 + the IVOA convention used by the clients):
+| Field | From | Meaning |
+|-------|------|---------|
+| `resource` | `RS_RESOURCE_ID` | The canonical id of the resource. Every protected URL must be covered by it (§2) and a token's `aud`, when present, must include it. |
+| `authorization_servers` | `RS_ISSUER` | Issuer(s) the resource accepts tokens from. The client trusts one **only after** the resource check. |
+| `scopes_supported` | `RS_REQUIRED_SCOPE` | Scopes the resource understands. |
+| `bearer_methods_supported` | — | `header` = `Authorization: Bearer`. |
 
-| Field | Required | Meaning |
-|-------|----------|---------|
-| `resource` | yes | The canonical id of the protected resource. The token's `aud` must equal this, and every protected URL must be path-prefix-covered by it. |
-| `authorization_servers` | yes | Issuer URL(s) allowed to mint tokens for this resource. The client trusts `authorization_servers[0]` **only after** the domain-proxy check. |
-| `scopes_supported` | recommended | Scopes the resource understands (here `vo.read`). |
-| `bearer_methods_supported` | recommended | How the token may be presented; `header` = `Authorization: Bearer`. |
-| `resource_documentation` | optional | Human-facing docs URL. |
-| `protected_resources` | optional (IVOA ext.) | A list of resource ids the descriptor is authoritative for, when one PRM covers several services. The clients fall back to the single `resource` value if absent. |
+It is served at the RFC 9728 §3.1 URL: the well-known suffix is **inserted between
+the host and the path** of `RS_RESOURCE_ID` (`https://src.local.io/vo` would be
+published at `https://src.local.io/.well-known/oauth-protected-resource/vo`).
+`RS_PRM_URL` sets the pointer in the 401 challenge; it defaults to that URL.
 
-The two security gates the client runs against this document:
+### 6.2 The metadata augmenter (`augmenter/app.py`)
 
-* **gate (a):** `host(prm_url) == host(authorization_servers[0])` — the sidecar
-  and the issuer share an origin.
-* **gate (b):** the resource URL the client started from is path-prefix-covered
-  by `resource` (or one entry of `protected_resources`).
+A small stdlib-Python reverse proxy. It fetches the IAM's **live** metadata over
+the internal network, adds one member, and returns everything else unchanged
+(above all `issuer`):
 
-### 6.2 Serving it (`sidecar/nginx.conf`)
-
-A bare nginx serves exactly that one path and 404s everything else:
-
-```nginx
-server {
-    listen 80;
-    default_type application/json;
-    # The PRM document is mounted under this root; without it nginx uses its
-    # compiled-in default (/etc/nginx/html) and try_files 404s.
-    root /usr/share/nginx/html;
-
-    location = /.well-known/oauth-protected-resource {
-        add_header Content-Type application/json;
-        try_files /.well-known/oauth-protected-resource =404;
-    }
-
-    location / { return 404; }
-}
+```json
+"protected_resources": ["https://src.local.io"]
 ```
 
-> ⚠️ The `root /usr/share/nginx/html;` line is **required**. Without it nginx
-> resolves `try_files` against its compiled-in default directory and returns
-> `404` even though the file is mounted.
+* The list comes from `augmenter/config/protected_resources.json` and is read on
+  **every request**, so an edit takes effect at once. The IAM's own metadata is
+  cached for ~60 s (`AUGMENTER_CACHE_SECONDS`).
+* If the IAM has no RFC 8414 document, one is derived from its OIDC discovery
+  document.
+* If the upstream document already contains `protected_resources`, it is left
+  alone — native support wins.
+* If the config file is missing or unreadable the member is **omitted**, which a
+  client treats as a failure (it fails closed).
 
-The `prm.json` file is mounted into the container at the served path:
+> **This is the interim emulation described in the AuthVO draft's implementation
+> note. Delete the `augmenter` service and its Traefik router as soon as INDIGO IAM
+> publishes `protected_resources` natively.**
 
-```yaml
-# docker-compose.yml (prm-sidecar service)
-volumes:
-  - ./sidecar/prm.json:/usr/share/nginx/html/.well-known/oauth-protected-resource:ro
-  - ./sidecar/nginx.conf:/etc/nginx/conf.d/default.conf:ro
-```
+### 6.3 Routing on the IAM origin (Traefik)
 
-### 6.3 Putting it on the IAM origin (Traefik)
-
-The sidecar must answer on `iam.local.io` at exactly the well-known path, with a
-**higher router priority** than the IAM so that one path wins on the shared
-origin:
+The augmenter answers exactly the two metadata paths, with a **higher router
+priority** than the IAM, so those paths win on the shared `iam.local.io` origin:
 
 ```yaml
 labels:
   - "traefik.enable=true"
-  - "traefik.http.routers.prm.rule=Host(`iam.local.io`) && Path(`/.well-known/oauth-protected-resource`)"
-  - "traefik.http.routers.prm.entrypoints=websecure"
-  - "traefik.http.routers.prm.tls=true"
-  - "traefik.http.routers.prm.priority=100"     # IAM router is priority 1
-  - "traefik.http.services.prm.loadbalancer.server.port=80"
+  - "traefik.http.routers.augmenter.rule=Host(`iam.local.io`) && (Path(`/.well-known/oauth-authorization-server`) || Path(`/.well-known/openid-configuration`))"
+  - "traefik.http.routers.augmenter.entrypoints=websecure"
+  - "traefik.http.routers.augmenter.tls=true"
+  - "traefik.http.routers.augmenter.priority=100"     # IAM router is priority 1
+  - "traefik.http.services.augmenter.loadbalancer.server.port=8080"
 ```
+
+### 6.4 The "evil" resource server
+
+`evil.local.io` is a second `fake-rs` instance. Its 401 points at its own,
+perfectly well-formed PRM, which **names the real IAM** as its authorization
+server — exactly the attack — but `https://evil.local.io` is not in the IAM's
+`protected_resources`. Every client must therefore abort at the resource check,
+before registration or any login. Its payload reads "EVIL SERVICE" so a leak
+would be obvious.
 
 ---
 
@@ -326,10 +360,12 @@ INSERT INTO system_scope(scope,description,restricted,default_scope,structured)
   VALUES ('vo.read','Read access to VO protected resources',0,0,0);
 ```
 
-**c) An OAuth client** — only needed by `demo.py`/`auto_demo.py`, which read a
-preconfigured `client_id` from `seed/client_id`. `human_demo.py` registers its
-own client at runtime instead. To create a friendly `client_id` (DCR generates a
-random one), register via DCR then rename it and add the token-exchange grant:
+**c) An OAuth client** — only needed by `demo.py`/`auto_demo.py` and the scenario
+runner, which read a preconfigured `client_id` from `seed/client_id`.
+`human_demo.py` registers its own client at runtime instead. To create a friendly
+`client_id` (DCR generates a random one), register via DCR then rename it and add
+the token-exchange grant (which the clients only use when token exchange is
+switched on, §7.4):
 
 ```sql
 UPDATE client_details SET client_id='authvo-client' WHERE client_id='<generated>';
@@ -338,28 +374,48 @@ INSERT INTO client_grant_type(owner_id, grant_type)
   FROM client_details WHERE client_id='authvo-client';
 ```
 
-### 7.4 The token-exchange restriction (important)
+### 7.4 Audience binding, and the token-exchange restriction
+
+The clients ask for audience binding with the RFC 8707 **`resource`** parameter on
+the device-grant token request, and stop there: RFC 8693 token exchange is
+**optional and off by default** (`AuthVoClient(token_exchange=True)`,
+`AUTHVO_TOKEN_EXCHANGE=1`, or `--token-exchange` on the demos). Whether the JWT
+that comes back carries an `aud` is up to the issuer — which is why the resource
+server enforces `aud` **whenever the token has one** (it must include the
+resource) without *requiring* one; the signature, `iss`, `vo.read` and expiry are
+always checked.
+
+> **Observed with the pinned INDIGO IAM v1.10.0:** it *accepts* the `resource`
+> parameter but **ignores it** — the access token has no `aud` (the clients log
+> `aud=<absent>`). So against INDIGO the flow works, but the token is not
+> audience-bound unless the **optional token exchange** is used: with it on
+> (scenario 1c in §10) the exchanged token carries `aud=https://src.local.io`.
+> Without an `aud` the resource server cannot tell a token minted for it from one
+> minted for another service this issuer serves, so deployments that want replay
+> protection against INDIGO should enable the exchange (or an issuer that honours
+> RFC 8707). Clients log the token's `aud` for information only and never fail
+on it. (Earlier versions of `human_demo` used INDIGO's non-standard `aud` request
+parameter; that is gone — the clients send `resource` only.)
 
 `DefaultClientRegistrationService` hard-codes
 `FORBIDDEN_GRANT_TYPES_FOR_ANONYMOUS` to include `token-exchange` and
 `password`. A **self-registered** (RFC 7591) client therefore **cannot** request
-the token-exchange grant — there is no env toggle for this.
+the token-exchange grant — there is no env toggle for this. Consequently:
 
-Two ways to still get an audience-bound token:
-
-* **Preconfigured client + token exchange** (`authvo_client.py`, `demo.py`):
-  register the client with the token-exchange grant (admin/DB), get a broad
-  token, then exchange it down to `aud=<resource>`.
-* **Dynamic client + `aud` request parameter** (`human_demo.py`): pass
-  `aud=<resource>` on the device-grant token request. INDIGO issues a token
-  already bound to that audience, so **no token exchange is needed** — which is
-  what lets a purely self-registered client complete the flow.
+* By default every client, including a purely self-registered one, completes the
+  flow with the `resource` indicator alone, and dynamic registration asks only for
+  the device-code grant.
+* To use token exchange as well, use a **preconfigured** client that was given the
+  grant (`provision.sh` does this for `authvo-client`) and switch it on.
 
 ---
 
 ## 8. TLS / certificates
 
-`setup.sh` generates a local CA and a `*.local.io` leaf. Modern OpenSSL 3
+`setup.sh` generates a local CA and a leaf certificate for `iam.local.io`,
+`src.local.io` and `evil.local.io`. The CA is created once and kept; only the
+**leaf** is re-issued if it lacks a name (e.g. it predates `evil.local.io`), so a
+CA you already trust stays valid. Modern OpenSSL 3
 (used by Python 3.11+) **rejects a CA without the proper X.509 extensions**
 (`CA cert does not include key usage extension`), so the CA and leaf are issued
 with explicit extensions:
@@ -375,7 +431,7 @@ openssl req -x509 -nodes -newkey rsa:2048 -days 825 \
 basicConstraints = CA:FALSE
 keyUsage = digitalSignature, keyEncipherment
 extendedKeyUsage = serverAuth
-subjectAltName = DNS:iam.local.io, DNS:src.local.io
+subjectAltName = DNS:iam.local.io, DNS:src.local.io, DNS:evil.local.io
 ```
 
 ---
@@ -385,12 +441,21 @@ subjectAltName = DNS:iam.local.io, DNS:src.local.io
 A small Flask service standing in for a TAP/DataLink/SODA endpoint.
 
 * Unauthenticated `GET /vo-resource` (or `GET /datalink/download/...`) →
-  `401` with `WWW-Authenticate: Bearer resource_metadata="<PRM>"`.
+  `401` with `WWW-Authenticate: Bearer resource_metadata="<its own PRM>"`.
+* `GET /.well-known/oauth-protected-resource` → its **own PRM** (§6.1).
 * With a Bearer token it verifies, before returning anything: signature against
-  the IAM JWKS, `iss == IAM`, **`aud == its own resource id`**, scope contains
-  **`vo.read`**, not expired.
+  the IAM JWKS, `iss == IAM`, scope contains **`vo.read`**, not expired, and — if
+  the token carries an `aud` — that it **includes the resource's own id**.
 * Valid → `200` with the payload (`protected_resource.txt`).
 * Missing scope → `403 insufficient_scope`; bad/expired/wrong-aud → `401`.
+* With `RS_TEST_FAULTS=1` (on for the harness's `src` instance) it also serves two
+  deliberately broken discovery set-ups used by the negative scenarios:
+  `/faults/prm-not-covering/vo-resource` (its PRM describes a different resource)
+  and `/faults/prm-redirect/vo-resource` (its PRM URL redirects to a good PRM).
+
+The validation logic is covered by `tests/test_fake_rs.py`: the six cases — valid,
+wrong audience, missing scope, rogue issuer, expired, unauthenticated — plus the
+PRM endpoint, `aud` present/absent, and the fixtures.
 
 Two harness fixes worth noting:
 
@@ -409,32 +474,89 @@ cd test-integration
 ./setup.sh            # certs + keystore + Traefik config + up + provision (idempotent)
 ```
 
-`setup.sh` reproduces the whole working stack in one shot: it generates the CA/leaf
-certs (with the X.509 extensions OpenSSL 3 requires, §8) and the IAM signing
+`setup.sh` reproduces the whole working stack in one shot: it generates the CA and
+leaf certs (with the X.509 extensions OpenSSL 3 requires, §8) and the IAM signing
 keystore (§7.2), starts the stack, then runs `seed/provision.sh` to create the
 `vo.read` scope, the login users (`admin`/`password`, `vouser`/`vouser`) and the
 `authvo-client` (§7.3). It is safe to re-run.
 
-Then run any of the three drivers from `test-integration/demo/`:
+### The demo drivers
+
+Run any of them from `test-integration/demo/`:
 
 ```bash
-# Original reference driver — you complete the device login in a browser.
+# Reference driver — you complete the device login in a browser.
 python demo.py --resource https://src.local.io/vo-resource \
   --cacert ../certs/local-ca.pem --client-id-file ../seed/client_id
 
 # Non-interactive — auto-approves the device login as the given user.
 python auto_demo.py --username vouser --password vouser
 
-# Guided — explains and pauses on every step; client self-registers (RFC 7591),
-# you log in and approve on the IAM's own page.
+# Guided — explains and pauses on every step (including WHY each check exists);
+# the client self-registers (RFC 7591), you log in and approve on the IAM's page.
 python human_demo.py
 
 # Same guided flow in Java, no build step (JDK 11+):
 java HumanDemo.java
 ```
 
-On success the resource returns the protected payload (an ASCII galaxy in this
-harness).
+Add `--token-exchange` to `demo.py`/`auto_demo.py` to also run RFC 8693 exchange.
+On success the resource returns the protected payload (an ASCII galaxy here).
+
+### The reference clients
+
+```bash
+export REQUESTS_CA_BUNDLE=test-integration/certs/local-ca.pem
+AUTHVO_CLIENT_ID=$(cat test-integration/seed/client_id) \
+  python authvo_client.py https://src.local.io/vo-resource
+
+# Java: needs Jackson (core, annotations, databind) on the classpath, see pom.xml.
+javac -d out -cp "$JACKSON" AuthVoClient.java
+keytool -importcert -noprompt -alias authvo-local -file test-integration/certs/local-ca.pem \
+  -keystore ca.jks -storepass changeit
+AUTHVO_CLIENT_ID=$(cat test-integration/seed/client_id) \
+  java -Djavax.net.ssl.trustStore=ca.jks -Djavax.net.ssl.trustStorePassword=changeit \
+       -cp "out:$JACKSON" org.ivoa.authvo.AuthVoClient https://src.local.io/vo-resource
+```
+
+Both exit `0` only if the resource returns `200`, `1` on a failed check / network
+error / any other status. Set `AUTHVO_TOKEN_EXCHANGE=1` to also exchange the token.
+
+### Tests
+
+*Offline* (no Docker needed):
+
+```bash
+pip install requests flask "pyjwt[crypto]==2.7.0"
+python -m unittest discover -s test-integration/tests -p "test_*.py" -v
+
+# Java: the client (steps 1-3, stubbed HTTP) and the demos' helper copies
+javac -d out -cp "$JACKSON" AuthVoClient.java test-integration/tests/ClientOfflineTest.java
+java  -cp "out:$JACKSON" org.ivoa.authvo.ClientOfflineTest test-integration/tests/coverage_vectors.json
+javac -d out2 test-integration/demo/Demo.java test-integration/demo/HumanDemo.java test-integration/tests/DemoHelpersTest.java
+java  -cp out2 DemoHelpersTest test-integration/tests/coverage_vectors.json
+```
+
+*Live scenarios* — the real clients against the running stack, with the device
+login auto-approved:
+
+```bash
+python test-integration/tests/run_scenarios.py --java-cp "$JACKSON"
+```
+
+| # | Scenario | Expected |
+|---|----------|----------|
+| 0 | preflight | the stack serves the PRM, the augmented metadata, no PRM sidecar |
+| 1 | happy path (1: preconfigured client, 1b: dynamic registration, 1c: with the optional token exchange on), Python and Java | protected payload returned (1c: the exchanged token carries `aud`) |
+| 2 | evil resource server (`evil.local.io`) | abort at the resource check, before any login |
+| 3 | `protected_resources` removed from the augmenter config | abort at the resource check |
+| 4 | PRM `resource` does not cover the requested URL | abort at step 2 |
+| 5 | the PRM URL redirects | abort — redirects are never followed |
+| 6 | resource server's token-validation cases | unit tests pass |
+
+Every abort scenario also asserts the client stopped **before** registration and
+the device grant. If `evil.local.io` is not in `/etc/hosts` the runner maps it for
+the client processes only.
 
 ---
 
@@ -445,12 +567,16 @@ harness).
 | IAM exits: *Found more than one migration with version 1* | Flyway scanning both vendor dirs — set `SPRING_FLYWAY_LOCATIONS=classpath:db/migration/mysql`. |
 | IAM exits: H2 syntax error on `token_value(767)` | Datasource fell back to H2 — set the `SPRING_DATASOURCE_*` properties. |
 | IAM exits: *Key Set resource could not be read: keystore.jwks* | No signing keystore — generate one (§7.2) and set `IAM_KEY_STORE_LOCATION`. |
-| PRM URL returns nginx `404` | `root` missing in `sidecar/nginx.conf` (§6.2). |
-| PRM URL returns the IAM 404 page | Traefik hasn't re-registered the sidecar after a restart — retry, or restart the proxy. |
+| Client aborts: *check (b): the issuer publishes no protected_resources* | The augmenter isn't answering the metadata paths (Traefik hasn't registered it — retry or restart the proxy) or its config is empty. Check `curl --cacert test-integration/certs/local-ca.pem https://iam.local.io/.well-known/oauth-authorization-server \| jq .protected_resources` (§6.2). |
+| Client aborts: *STEP 2 FAILED … does not cover the requested URL* | The PRM's `resource` (`RS_RESOURCE_ID`) doesn't cover the URL you asked for (§2). |
+| Client aborts: *refusing to follow redirects* | A discovery URL answered 3xx. Clients never follow redirects; fix the URL (the PRM pointer, the issuer in the PRM). |
+| Client aborts: *check (a): metadata issuer … != the issuer named by the PRM* | `RS_ISSUER` and the IAM's `IAM_ISSUER` differ (mind the trailing slash). |
+| `augmenter` returns `502` | The IAM isn't up yet (or is down); it proxies the IAM's live metadata. |
+| `evil.local.io` doesn't resolve / TLS error for it | Add it to `/etc/hosts` (§5); re-run `./setup.sh` so the leaf certificate covers it. |
 | Client TLS: *CA cert does not include key usage extension* | Regenerate certs with the X.509 extensions (§8). |
 | RS `401 invalid_token`, `PyJWKClientConnectionError` | JWKS fetch can't verify TLS — set `SSL_CERT_FILE` on the resource (§9). |
 | RS `403 insufficient_scope` | Token has no `scope` claim — set `IAM_ACCESS_TOKEN_INCLUDE_SCOPE=true`. |
-| DCR: *Grant type not allowed: ...token-exchange* | Self-registration can't request token-exchange — use the `aud` parameter instead (§7.4). |
+| DCR: *Grant type not allowed: ...token-exchange* | Self-registration can't request token-exchange. It is off by default now; leave it off or use a preconfigured client (§7.4). |
 | `seed/provision.sh` times out after ~7.5 min with `IAM did not come up`, later demos get `404` instead of `401` | Host port 443 is already taken by something else, so the `proxy` (Traefik) service fails to start (`Bind for 0.0.0.0:443 failed: port is already allocated`) while the rest of the stack comes up fine — nothing is actually fronting `iam.local.io`/`src.local.io`, so discovery never succeeds and unrelated requests land wherever else 443 is bound. Check with `docker ps --format "{{.Names}}\t{{.Ports}}" \| grep 443` / `sudo lsof -iTCP:443 -sTCP:LISTEN`, free the port (or remap the `proxy` service's port and the IAM's `IAM_ISSUER`/`IAM_BASE_URL` via a `docker-compose.override.yml`), then re-run `./setup.sh`. |
 
 ---
@@ -459,8 +585,56 @@ harness).
 
 * This harness uses self-signed certs, throwaway passwords, and a public
   (`token_endpoint_auth_method: none`) client. It is for **local testing only**.
-* The whole security argument rests on IAM and sidecar **sharing one origin**.
-  Do not split them across hosts.
-* The resource server validates the token server-side (signature, `iss`, `aud`,
-  scope, expiry). The client's domain-proxy check is what stops it from sending a
-  token to a spoofed resource in the first place.
+* The security argument rests on the **resource check** (step 3): the issuer's own
+  metadata must name the same issuer *and* list the resource, and an absent list is
+  a failure. It does **not** rest on where any document is hosted. (The augmenter
+  sits on the IAM origin only because that is where the IAM's metadata is served;
+  being interim, it is the part to delete when INDIGO publishes the member.)
+* No discovery request, and no request carrying a bearer token, ever follows a
+  redirect.
+* The resource server validates the token server-side (signature, `iss`, scope,
+  expiry, and `aud` when present). The client's checks are what stop it from
+  sending the user to log in, and a token to be minted, for a spoofed resource in
+  the first place.
+
+---
+
+## 13. Changes for AuthVO issue #22
+
+The IVOA draft changed after [issue #22](https://github.com/ivoa-std/AuthVO/issues/22):
+the old design was not RFC 9728-conformant. The PRM was served from the **IAM's**
+origin by an nginx "sidecar", and the client's *domain-proxy check* required the
+sidecar and the issuer to share an origin. RFC 9728 says the PRM belongs to the
+**resource server**; the binding between resource and authorization server comes
+from the authorization server's own `protected_resources` metadata member.
+
+### Client flow: old step → new step
+
+| Old (domain-proxy design) | New |
+|---------------------------|-----|
+| 1 GET the resource anonymously | **1** probe — same, no redirects (made explicit in Python) |
+| 2 401 → sidecar pointer | **1** — the pointer is extracted as part of the probe (still untrusted) |
+| 3 GET the sidecar **at the IAM** | **2** GET the PRM published by the **resource server** (HTTPS, no redirects) |
+| 4(a) domain-proxy gate (a): sidecar origin == issuer origin | **removed.** Replaced by check (a) of step 3: the issuer's RFC 8414 metadata names the issuer the PRM named |
+| 4(b) gate (b): the resource is in the **sidecar's** list | split in two: **2** the PRM `resource` covers the URL, and **3(b)** the **issuer's** `protected_resources` covers it (reading `protected_resources` from the PRM is gone) |
+| 5 GET AS metadata (RFC 8414, then OIDC) | merged into **3**: the RFC 8414 document is where the check is made; OIDC discovery only reads missing endpoints, never skips (b) |
+| 6 dynamic registration | **4** — unchanged (asks for the token-exchange grant only if exchange is on) |
+| 7 device authorization, 8 prompt the user, 9 poll the token endpoint | **5** — now sends `resource=<matched id>` (RFC 8707) and shows the resource *and* the issuer; no INDIGO `aud` parameter |
+| 10 token exchange (RFC 8693) | **5d**, **optional, off by default** |
+| 11 access | **6** — no redirects, `aud` checked by the RS only when present |
+| 12 refresh | **7** — would re-send the same `resource`; not implemented |
+
+Code names follow: `_step4_domain_proxy_check` → `_step3_resource_check` (the AS-metadata
+fetch is merged into it), `_step3_fetch_sidecar` → `_step2_prm`; the same in
+`AuthVoClient.java`.
+
+### Harness
+
+| Before | After |
+|--------|-------|
+| `prm-sidecar` (nginx) + its Traefik router on `iam.local.io` | **removed** |
+| PRM at `https://iam.local.io/.well-known/oauth-protected-resource` | PRM served by **fake-rs** at `https://src.local.io/.well-known/oauth-protected-resource`; `RS_PRM_URL` points there |
+| IAM metadata exactly as INDIGO publishes it | served through the **augmenter**, which adds `protected_resources` (interim emulation; delete when INDIGO supports the member) |
+| `fake-rs` requires `aud == its id` | checks `aud` **when present**; token exchange no longer needed |
+| — | **evil** resource server on `evil.local.io` + negative scenarios; `evil.local.io` in the cert SANs and `/etc/hosts` |
+| — | offline tests and the live scenario runner (`test-integration/tests/`) |

@@ -10,9 +10,10 @@ flow the way a real client + real user would:
   * the HUMAN opens the IAM in a browser and types their own username/password
     into the IAM login page, then approves the request,
   * the client only ever uses the client_id it just obtained,
-  * the access token is bound to the target resource via the `aud` request
-    parameter on the device grant (RFC 8707 resource-indicator style), so the
-    resource server can enforce `aud == itself`.
+  * before any of that, the client REFUSES to proceed unless the issuer itself
+    vouches for the resource (the resource check, step 3),
+  * the token request carries the matched resource as an RFC 8707 `resource`
+    indicator, so an issuer that supports it can bind the token's audience.
 
 It stops before every step and explains what is about to happen and why.
 
@@ -20,12 +21,15 @@ It stops before every step and explains what is about to happen and why.
                        --cacert ../certs/local-ca.pem
 """
 import argparse
+import json
+import base64
 import sys
 import time
 import webbrowser
-from urllib.parse import urlparse
 
 import requests
+
+import authvo_checks as chk
 
 DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
 
@@ -51,8 +55,13 @@ def shown(label, value):
     print(f"  {GREEN}{label}{RESET} {value}")
 
 
-def host(url):
-    return urlparse(url).netloc
+def ok(msg):
+    print(f"{GREEN}  {msg}{RESET}")
+
+
+def refuse(msg):
+    print(f"{RED}  {msg}{RESET}")
+    print(f"{RED}  -> ABORT. Nothing was sent anywhere and you were never asked to log in.{RESET}")
 
 
 # --------------------------------------------------------------------------- #
@@ -75,164 +84,225 @@ def main():
     print(f"Target protected resource: {BOLD}{args.resource}{RESET}")
     print("We are a brand-new client that knows nothing but that URL.")
 
-    # ---- STEP 1 --------------------------------------------------------- #
-    step("1", "Knock on the door anonymously",
-         "A real client starts with just a resource URL and no token.",
-         "We GET it with no Authorization header. We EXPECT a 401 whose",
-         "WWW-Authenticate header hands back ONLY a pointer to a metadata",
-         "document (the PRM). The pointer is UNTRUSTED at this stage -- a",
-         "malicious server could put anything here.")
-    r = s.get(args.resource)
-    shown("HTTP status :", r.status_code)
-    if r.status_code != 401:
-        print(f"{RED}Expected 401, aborting.{RESET}"); return 1
-    challenge = r.headers.get("WWW-Authenticate", "")
-    shown("WWW-Authenticate:", challenge)
-    prm_url = challenge.split('resource_metadata="', 1)[1].split('"', 1)[0]
-    shown("=> PRM pointer (untrusted):", prm_url)
+    try:
+        # ---- STEP 1 --------------------------------------------------------- #
+        step("1", "Knock on the door anonymously",
+             "A real client starts with just a resource URL and no token.",
+             "We GET it with no Authorization header, and we do NOT follow redirects",
+             "(a redirect could itself be a trick). We EXPECT a 401 whose",
+             "WWW-Authenticate header hands back ONLY a pointer to a metadata",
+             "document. The pointer is UNTRUSTED -- a malicious server could put",
+             "anything there, including a link to a document it forged.")
+        r = s.get(args.resource, allow_redirects=False)
+        shown("HTTP status :", r.status_code)
+        if r.status_code != 401:
+            print(f"{RED}Expected 401, aborting.{RESET}")
+            return 1
+        challenge = r.headers.get("WWW-Authenticate", "")
+        shown("WWW-Authenticate:", challenge)
+        pointer = chk.parse_pointer(challenge)
+        chk.require_https(pointer, "PRM pointer")
+        shown("=> PRM pointer (untrusted):", pointer)
 
-    # ---- STEP 2 --------------------------------------------------------- #
-    step("2", "Fetch the Protected-Resource-Metadata (the 'sidecar')",
-         "We follow the pointer and read the RFC 9728 descriptor. It tells us",
-         "which authorization server (issuer) governs this resource, and which",
-         "resources that descriptor is actually authoritative for.")
-    prm = s.get(prm_url).json()
-    issuer = prm["authorization_servers"][0]
-    shown("resource described :", prm["resource"])
-    shown("issuer (AS)        :", issuer)
-    shown("scopes_supported   :", prm.get("scopes_supported"))
+        # ---- STEP 2 --------------------------------------------------------- #
+        step("2", "Fetch the resource server's own Protected-Resource-Metadata",
+             "We follow the pointer and read the RFC 9728 document. It is published",
+             "by the RESOURCE SERVER about itself: which resource it is, and which",
+             "authorization server(s) it says issue tokens for it.",
+             "",
+             "Our only check here: the resource it describes must COVER the URL we",
+             "asked for (the same address, or one that starts with it at a '/'",
+             "boundary -- /vo covers /vo/tap/async/1 but not /vocab). A document",
+             "about some OTHER resource is useless to us, and a sign of spoofing.")
+        prm = chk.get_json(s, pointer, "Protected Resource Metadata")
+        shown("resource described  :", prm.get("resource"))
+        shown("authorization_servers:", prm.get("authorization_servers"))
+        shown("scopes_supported    :", prm.get("scopes_supported"))
+        issuers = chk.check_prm(args.resource, prm)
+        ok(f"OK: {prm['resource']} covers {args.resource}")
 
-    # ---- STEP 3 --------------------------------------------------------- #
-    step("3", "DOMAIN-PROXY CHECK  (the security crux)",
-         "This is what defeats the 'evil service'. Before trusting the issuer,",
-         "we require TWO things:",
-         "  (a) the PRM is served from the SAME origin as the issuer it names",
-         "      -- so only the real IAM can vouch for its own resources;",
-         "  (b) the resource we actually called is one the descriptor covers.",
-         "If either fails we ABORT -- we never send a token somewhere a spoofed",
-         "401 told us to.")
-    print(f"  checking (a): sidecar host {host(prm_url)!r} == issuer host {host(issuer)!r}")
-    if host(prm_url) != host(issuer):
-        print(f"{RED}  GATE (a) FAILED -> ABORT{RESET}"); return 2
-    print(f"{GREEN}  gate (a) OK{RESET}")
-    print(f"  checking (b): {args.resource!r} starts with {prm['resource']!r}")
-    if not args.resource.startswith(prm["resource"]):
-        print(f"{RED}  GATE (b) FAILED -> ABORT{RESET}"); return 2
-    print(f"{GREEN}  gate (b) OK -> the issuer is trusted for this resource{RESET}")
+        # ---- STEP 3 --------------------------------------------------------- #
+        step("3", "RESOURCE CHECK  (the security crux)",
+             "Everything so far came from the resource server -- and a resource server",
+             "can say anything about itself. Picture an EVIL service: it answers 401,",
+             "and its own metadata politely names the REAL identity provider as the",
+             "issuer. If we believed that, we would send the user to log in at the",
+             "real IAM and then hand the resulting real token to the evil service.",
+             "",
+             "So we ask the other side. The issuer's OWN metadata (RFC 8414), fetched",
+             "from the issuer, must say two things:",
+             "  (a) 'issuer' is exactly the issuer the resource named -- it really is",
+             "      that issuer's document;",
+             "  (b) 'protected_resources' lists a resource covering our URL -- the",
+             "      issuer itself vouches that it issues tokens for this service.",
+             "If the issuer publishes NO list, we ABORT too: an unanswered question is",
+             "not a yes. And all of this happens BEFORE you are asked to log in.")
+        # Run the two gates one at a time (chk.resource_check does the same in one
+        # call) so each result is visible. The first issuer passing both is used.
+        passed, failures = None, []
+        for candidate in issuers:
+            try:
+                chk.require_https(candidate, "Issuer")
+                as_url, oidc_url = chk.as_metadata_urls(candidate)
+                shown("fetching the issuer's metadata:", as_url)
+                as_doc = chk.get_json(s, as_url, "RFC 8414 metadata")
+                print(f"  checking (a): metadata issuer {as_doc.get('issuer')!r} == named issuer {candidate!r}")
+                chk.check_a(as_doc, candidate)
+                ok("gate (a) OK")
+                print(f"  checking (b): is {args.resource!r} covered by {as_doc.get('protected_resources')}?")
+                resource_id = chk.check_b(as_doc, args.resource)
+                ok(f"gate (b) OK -> the issuer vouches for {resource_id}")
+                passed = (candidate, as_doc, resource_id, oidc_url)
+                break
+            except chk.Abort as e:
+                print(f"{RED}  issuer {candidate} REJECTED: {e}{RESET}")
+                failures.append(f"{candidate}: {e}")
+        if passed is None:
+            raise chk.Abort("no authorization server vouches for " + args.resource)
+        issuer, as_doc, resource_id, oidc_url = passed
+        ep = chk.endpoints(s, as_doc, issuer, oidc_url, "registration_endpoint",
+                           "device_authorization_endpoint", "token_endpoint")
+        print(f"{DIM}  Now that we trust the issuer for this resource we read its endpoints:{RESET}")
+        for k, v in ep.items():
+            shown(f"{k:29}:", v)
 
-    # ---- STEP 4 --------------------------------------------------------- #
-    step("4", "Read the Authorization Server metadata (RFC 8414)",
-         "Now that we trust the issuer, we discover its endpoints from its",
-         "well-known document: where to register, where to start the device",
-         "flow, and where to get tokens.")
-    meta = s.get(issuer.rstrip("/") + "/.well-known/openid-configuration").json()
-    shown("registration_endpoint        :", meta["registration_endpoint"])
-    shown("device_authorization_endpoint:", meta["device_authorization_endpoint"])
-    shown("token_endpoint               :", meta["token_endpoint"])
+        # ---- STEP 4 --------------------------------------------------------- #
+        step("4", "Register OURSELVES dynamically (RFC 7591)",
+             "Nothing was pre-provisioned for this client. We ask the IAM to mint a",
+             "fresh client_id for us. We declare we are a public client doing the",
+             "device-code grant. (This IAM forbids self-registered clients from",
+             "requesting token-exchange, which is fine: token exchange is optional.)")
+        reg = s.post(ep["registration_endpoint"], json={
+            "client_name": "authvo-human-demo",
+            "token_endpoint_auth_method": "none",
+            "grant_types": [DEVICE_GRANT, "refresh_token"],
+            "response_types": [],
+            "scope": f"openid {args.scope}",
+        }, allow_redirects=False)
+        if reg.status_code >= 400:
+            print(f"{RED}registration failed: {reg.status_code} {reg.text}{RESET}")
+            return 3
+        reg = reg.json()
+        client_id = reg["client_id"]
+        shown("=> our NEW client_id:", client_id)
+        shown("   granted scopes   :", reg.get("scope"))
+        print(f"{DIM}   From here on, every request carries THIS client_id.{RESET}")
 
-    # ---- STEP 5 --------------------------------------------------------- #
-    step("5", "Register OURSELVES dynamically (RFC 7591)",
-         "Nothing was pre-provisioned for this client. We ask the IAM to mint a",
-         "fresh client_id for us. We declare we are a public client doing the",
-         "device-code grant. (This IAM forbids self-registered clients from",
-         "requesting token-exchange, so we won't use it -- see step 8.)")
-    reg = s.post(meta["registration_endpoint"], json={
-        "client_name": "authvo-human-demo",
-        "token_endpoint_auth_method": "none",
-        "grant_types": [DEVICE_GRANT, "refresh_token"],
-        "response_types": [],
-        "scope": f"openid {args.scope}",
-    })
-    if reg.status_code >= 400:
-        print(f"{RED}registration failed: {reg.status_code} {reg.text}{RESET}"); return 3
-    reg = reg.json()
-    client_id = reg["client_id"]
-    shown("=> our NEW client_id:", client_id)
-    shown("   granted scopes   :", reg.get("scope"))
-    print(f"{DIM}   From here on, every request carries THIS client_id.{RESET}")
-
-    # ---- STEP 6 --------------------------------------------------------- #
-    step("6", "Start the device-authorization grant (RFC 8628)",
-         "We send our client_id and the scopes we want. The IAM returns a code",
-         "the user will approve, plus the URL where they go to do it.")
-    da = s.post(meta["device_authorization_endpoint"], data={
-        "client_id": client_id,
-        "scope": f"openid {args.scope}",
-    }).json()
-    verify = da.get("verification_uri_complete") or da["verification_uri"]
-    shown("user_code        :", da["user_code"])
-    shown("verification_uri :", verify)
-
-    # ---- STEP 7 --------------------------------------------------------- #
-    step("7", "HUMAN STEP: log in to the IAM and approve",
-         "Now YOU act as the resource owner. Open the URL below in a browser,",
-         "log in with your IAM username/password ON THE IAM'S OWN PAGE (the",
-         "client never sees your credentials), and approve the request for",
-         f"scope '{args.scope}'. Meanwhile this client just polls and waits.",
-         "",
-         f"   Open : {verify}",
-         f"   Code : {da['user_code']}")
-    if not args.no_browser:
-        try:
-            webbrowser.open(verify)
-            print(f"{DIM}  (tried to open your browser automatically){RESET}")
-        except Exception:
-            pass
-    print(f"\n{YELLOW}  Polling the token endpoint until you approve...{RESET}")
-
-    # ---- STEP 8 --------------------------------------------------------- #
-    # (polling happens here; explained as part of step 7/8)
-    interval = da.get("interval", 5)
-    deadline = time.time() + da.get("expires_in", 600)
-    token = None
-    while time.time() < deadline:
-        tr = s.post(meta["token_endpoint"], data={
-            "grant_type": DEVICE_GRANT,
-            "device_code": da["device_code"],
+        # ---- STEP 5 --------------------------------------------------------- #
+        step("5", "Start the device-authorization grant (RFC 8628)",
+             "We send our client_id and the scopes we want. The IAM returns a code",
+             "the user will approve, plus the URL where they go to do it.")
+        da = s.post(ep["device_authorization_endpoint"], data={
             "client_id": client_id,
-            # RFC 8707-style resource indicator: bind the token's audience to the
-            # target resource up-front, so we don't need a separate token
-            # exchange. The RS will enforce aud == its own id.
-            "aud": prm["resource"],
-        })
-        body = tr.json()
-        if tr.status_code == 200:
-            token = body["access_token"]
-            break
-        if body.get("error") not in ("authorization_pending", "slow_down"):
-            print(f"{RED}  token error: {body}{RESET}"); return 4
-        print(f"{DIM}  ...still waiting (server says: {body.get('error')}){RESET}")
-        time.sleep(interval)
-    if not token:
-        print(f"{RED}  timed out waiting for approval{RESET}"); return 4
-    print(f"\n{GREEN}  Approved! Got an access token.{RESET}")
+            "scope": f"openid {args.scope}",
+        }, allow_redirects=False).json()
+        verify = da.get("verification_uri_complete") or da["verification_uri"]
+        shown("user_code        :", da["user_code"])
+        shown("verification_uri :", verify)
 
-    step("8", "Inspect the audience-bound token",
-         "Because we passed `aud` on the device grant, the IAM issued a token",
-         "scoped to exactly this resource -- no broad token, no token exchange.",
-         "Let's look at the claims the resource server will check.")
-    import json, base64
-    p = token.split(".")[1]; p += "=" * (-len(p) % 4)
-    claims = json.loads(base64.urlsafe_b64decode(p))
-    for k in ("aud", "iss", "scope", "client_id", "sub", "exp"):
-        shown(f"{k:9}:", claims.get(k))
+        # ---- STEP 5b -------------------------------------------------------- #
+        step("5b", "HUMAN STEP: log in to the IAM and approve",
+             "Now YOU act as the resource owner. Check what you are authorizing:",
+             "",
+             f"   Resource          : {args.resource}",
+             f"   Token is for      : {resource_id}",
+             f"   Identity provider : {issuer}",
+             "",
+             "Open the URL below in a browser, log in with your IAM username/password",
+             "ON THE IAM'S OWN PAGE (the client never sees your credentials), and",
+             f"approve the request for scope '{args.scope}'. Meanwhile this client",
+             "just polls and waits.",
+             "",
+             f"   Open : {verify}",
+             f"   Code : {da['user_code']}")
+        if not args.no_browser:
+            try:
+                webbrowser.open(verify)
+                print(f"{DIM}  (tried to open your browser automatically){RESET}")
+            except Exception:
+                pass
+        print(f"\n{YELLOW}  Polling the token endpoint until you approve...{RESET}")
 
-    # ---- STEP 9 --------------------------------------------------------- #
-    step("9", "Call the resource with the token",
-         "Finally we retry the original request, now as Bearer <token>. The",
-         "resource server verifies the signature against the IAM's JWKS, checks",
-         f"iss, aud == itself, scope contains '{args.scope}', and not expired.")
-    fr = s.get(args.resource, headers={"Authorization": f"Bearer {token}"})
+        interval = da.get("interval", 5)
+        deadline = time.time() + da.get("expires_in", 600)
+        token = None
+        while time.time() < deadline:
+            tr = s.post(ep["token_endpoint"], data={
+                "grant_type": DEVICE_GRANT,
+                "device_code": da["device_code"],
+                "client_id": client_id,
+                # RFC 8707 resource indicator: the resource the issuer vouched for
+                # in step 3. An issuer that supports it binds the token's audience
+                # to it; one that does not simply ignores it.
+                "resource": resource_id,
+            }, allow_redirects=False)
+            body = tr.json()
+            if tr.status_code == 200:
+                token = body["access_token"]
+                break
+            if body.get("error") not in ("authorization_pending", "slow_down"):
+                print(f"{RED}  token error: {body}{RESET}")
+                return 4
+            print(f"{DIM}  ...still waiting (server says: {body.get('error')}){RESET}")
+            time.sleep(interval)
+        if not token:
+            print(f"{RED}  timed out waiting for approval{RESET}")
+            return 4
+        print(f"\n{GREEN}  Approved! Got an access token.{RESET}")
+
+        # ---- STEP 5c -------------------------------------------------------- #
+        step("5c", "Inspect the token -- and why audience binding still matters",
+             "A token is a bearer instrument: whoever holds it can use it. The",
+             "'aud' (audience) claim says WHICH service it is meant for. If the",
+             "issuer sets it, a token minted for one service is useless at another,",
+             "so a leaked or captured token cannot be replayed elsewhere.",
+             "",
+             "We asked for it with the 'resource' indicator, but binding is up to",
+             "the issuer: some do, some ignore the request. So this client does not",
+             "rely on it -- the RESOURCE SERVER enforces it: it refuses any token",
+             "whose aud names someone else, and accepts a token with no aud only",
+             "because the signature, issuer, scope and expiry are also checked.")
+        claims = _claims(token)
+        for k in ("aud", "iss", "scope", "client_id", "sub", "exp"):
+            shown(f"{k:9}:", claims.get(k, "<absent>"))
+        if "aud" not in claims:
+            print(f"{DIM}  (no aud: this issuer did not bind an audience for this request){RESET}")
+    except chk.Abort as e:
+        refuse(str(e))
+        return 2
+
+    # ---- STEP 6 ------------------------------------------------------------- #
+    step("6", "Call the resource with the token",
+         "Finally we retry the original request, now as Bearer <token>, still",
+         "without following redirects (a redirect must never carry the token",
+         "somewhere the resource did not name). The resource server verifies the",
+         "signature against the IAM's JWKS, checks iss, scope contains",
+         f"'{args.scope}', not expired, and aud == itself whenever the token has one.")
+    fr = s.get(args.resource, headers={"Authorization": f"Bearer {token}"},
+               allow_redirects=False)
     shown("HTTP status:", fr.status_code)
     if fr.status_code != 200:
-        print(f"{RED}  access failed: {fr.text}{RESET}"); return 5
+        print(f"{RED}  access failed: {fr.text}{RESET}")
+        return 5
     print(f"\n{BOLD}{GREEN}  SUCCESS -- the resource returned:{RESET}")
     print(f"{BOLD}{GREEN}      {fr.text}{RESET}")
     return 0
+
+
+def _claims(token):
+    """Decode (WITHOUT verifying) a JWT payload, only to display its claims."""
+    parts = token.split(".")
+    if len(parts) != 3:
+        return {}
+    try:
+        return json.loads(base64.urlsafe_b64decode(parts[1] + "=" * (-len(parts[1]) % 4)))
+    except Exception:
+        return {}
 
 
 if __name__ == "__main__":
     try:
         sys.exit(main())
     except KeyboardInterrupt:
-        print("\ninterrupted."); sys.exit(130)
+        print("\ninterrupted.")
+        sys.exit(130)

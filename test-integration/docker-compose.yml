@@ -1,10 +1,16 @@
 # AuthVO local integration harness
 # -----------------------------------------------------------------------------
-# Brings up, behind a single TLS origin (iam.local.io):
+# Brings up, behind Traefik's TLS port, on the IAM origin (iam.local.io):
 #   - INDIGO IAM  (+ MariaDB, Redis, trustanchors)   -> the authorization server
-#   - prm-sidecar (nginx serving one RFC 9728 JSON)   -> the "sidecar"
-# and, on a second origin (src.local.io):
-#   - resource    (the protected REST interface)      -> the demo closer
+#   - augmenter   (tiny Python reverse proxy)         -> adds the RFC 9728
+#       `protected_resources` member to the IAM's two metadata documents (an
+#       INTERIM emulation; delete it once INDIGO publishes the member itself)
+# and, on its own origin (src.local.io):
+#   - resource    (the protected REST interface)      -> the demo closer; it
+#       serves its OWN RFC 9728 Protected Resource Metadata
+# and, on a third origin (evil.local.io), for the negative test:
+#   - evil        (a second fake-rs)                  -> names the real IAM in its
+#       PRM but is not in the IAM's protected_resources, so clients must refuse it
 #
 # Run ./setup.sh first: it generates the *.local.io certs and the Traefik
 # dynamic config, reminds you about /etc/hosts, then `docker compose up`.
@@ -12,7 +18,7 @@
 # NOTE on INDIGO IAM: image tags, env var names and the bootstrap mechanism
 # move between releases. The `iam` service below mirrors the upstream
 # indigo-iam/iam compose shape; pin a known-good tag and adjust env to your
-# version. The harness around it (sidecar, proxy, resource, demo) is stable.
+# version. The harness around it (augmenter, proxy, resource, demo) is stable.
 
 services:
   proxy:
@@ -67,28 +73,37 @@ services:
       - ./iam/keys/keystore.jwks:/keystore.jwks:ro
     labels:
       - "traefik.enable=true"
-      # IAM gets the whole iam.local.io host EXCEPT the PRM path (see sidecar).
+      # IAM gets the whole iam.local.io host EXCEPT its two metadata documents,
+      # which the higher-priority `augmenter` router below intercepts.
       - "traefik.http.routers.iam.rule=Host(`iam.local.io`)"
       - "traefik.http.routers.iam.entrypoints=websecure"
       - "traefik.http.routers.iam.tls=true"
       - "traefik.http.routers.iam.priority=1"
       - "traefik.http.services.iam.loadbalancer.server.port=8080"
 
-  # --- The "sidecar": one static RFC 9728 document, co-located at the IAM ----
-  prm-sidecar:
-    image: nginx:alpine
+  # --- Metadata augmenter: the IAM's discovery documents + protected_resources
+  # INTERIM emulation of RFC 9728 section 4 (see augmenter/app.py). It proxies the
+  # IAM's live metadata and adds `protected_resources` from a mounted file.
+  # REMOVE this service and its router once INDIGO IAM publishes the member.
+  augmenter:
+    build: ./augmenter
+    environment:
+      AUGMENTER_UPSTREAM: "http://iam:8080"       # the IAM, on the internal network
+      AUGMENTER_UPSTREAM_HOST: "iam.local.io"     # so the IAM emits its public URLs
+      AUGMENTER_CACHE_SECONDS: "60"
     volumes:
-      - ./sidecar/prm.json:/usr/share/nginx/html/.well-known/oauth-protected-resource:ro
-      - ./sidecar/nginx.conf:/etc/nginx/conf.d/default.conf:ro
+      # Mount the DIRECTORY (not the single file) so editors that replace the
+      # file on save don't leave a stale bind mount; the app re-reads it per request.
+      - ./augmenter/config:/config:ro
     labels:
       - "traefik.enable=true"
-      # Higher priority than the IAM router so this exact path wins on the
-      # shared iam.local.io origin.
-      - "traefik.http.routers.prm.rule=Host(`iam.local.io`) && Path(`/.well-known/oauth-protected-resource`)"
-      - "traefik.http.routers.prm.entrypoints=websecure"
-      - "traefik.http.routers.prm.tls=true"
-      - "traefik.http.routers.prm.priority=100"
-      - "traefik.http.services.prm.loadbalancer.server.port=80"
+      # Higher priority than the IAM router so exactly these two paths win on
+      # the shared iam.local.io origin; every other path still reaches the IAM.
+      - "traefik.http.routers.augmenter.rule=Host(`iam.local.io`) && (Path(`/.well-known/oauth-authorization-server`) || Path(`/.well-known/openid-configuration`))"
+      - "traefik.http.routers.augmenter.entrypoints=websecure"
+      - "traefik.http.routers.augmenter.tls=true"
+      - "traefik.http.routers.augmenter.priority=100"
+      - "traefik.http.services.augmenter.loadbalancer.server.port=8080"
 
   # --- Resource origin: the protected REST interface ------------------------
   resource:
@@ -96,8 +111,11 @@ services:
     environment:
       RS_RESOURCE_ID: "https://src.local.io"
       RS_ISSUER: "https://iam.local.io/"
-      RS_PRM_URL: "https://iam.local.io/.well-known/oauth-protected-resource"
+      # The 401 challenge points at THIS server's own PRM (RFC 9728 3.1): the
+      # resource server, not the IAM, publishes the metadata about itself.
+      RS_PRM_URL: "https://src.local.io/.well-known/oauth-protected-resource"
       RS_REQUIRED_SCOPE: "vo.read"
+      RS_TEST_FAULTS: "1"                   # serve the /faults/... discovery fixtures (negative tests)
       RS_CA_BUNDLE: "/certs/local-ca.pem"   # trust the harness origin for JWKS
       # PyJWKClient (pinned PyJWT 2.7.0) fetches the JWKS via urllib, which
       # ignores RS_CA_BUNDLE; point urllib's default TLS context at our CA too.
@@ -117,6 +135,33 @@ services:
       - "traefik.http.routers.rs.entrypoints=websecure"
       - "traefik.http.routers.rs.tls=true"
       - "traefik.http.services.rs.loadbalancer.server.port=8000"
+
+  # --- The "evil" resource server: the negative test --------------------------
+  # A second fake-rs on its OWN origin (evil.local.io). Its 401 points at its own
+  # perfectly well-formed PRM, which names the REAL IAM as the authorization server
+  # -- exactly the "evil service" attack -- but evil.local.io is NOT in the IAM's
+  # protected_resources (augmenter/config/protected_resources.json), so every
+  # client must abort at the resource check, before any login or device code.
+  evil:
+    build: ./fake-rs
+    environment:
+      RS_RESOURCE_ID: "https://evil.local.io"
+      RS_ISSUER: "https://iam.local.io/"    # <- names the real IAM
+      RS_PRM_URL: "https://evil.local.io/.well-known/oauth-protected-resource"
+      RS_REQUIRED_SCOPE: "vo.read"
+      RS_CA_BUNDLE: "/certs/local-ca.pem"
+      SSL_CERT_FILE: "/certs/local-ca.pem"
+      # A payload that makes a leak obvious if a client ever got this far.
+      RS_PAYLOAD_FILE: "/payload/evil_payload.txt"
+    volumes:
+      - ./certs/local-ca.pem:/certs/local-ca.pem:ro
+      - ./fake-rs:/payload:ro
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.evil.rule=Host(`evil.local.io`)"
+      - "traefik.http.routers.evil.entrypoints=websecure"
+      - "traefik.http.routers.evil.tls=true"
+      - "traefik.http.services.evil.loadbalancer.server.port=8000"
 
 volumes:
   trustanchors:

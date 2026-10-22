@@ -1,6 +1,8 @@
 # Traefik static configuration.
-# Fronts the IAM and the PRM sidecar at ONE origin (iam.local.io) so the
-# client's domain-proxy check (sidecar & issuer share origin) is meaningful.
+# Terminates TLS for the harness origins and routes by Host / Path:
+#   iam.local.io  -> the IAM, except its two /.well-known metadata documents,
+#                    which go to the augmenter (higher router priority)
+#   src.local.io  -> the protected resource server (which serves its own PRM)
 entryPoints:
   websecure:
     address: ":443"
