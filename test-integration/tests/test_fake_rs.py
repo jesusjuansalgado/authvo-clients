@@ -33,6 +33,7 @@ os.environ.update({
     "RS_ISSUER": "https://iam.local.io/",
     "RS_REQUIRED_SCOPE": "vo.read",
     "RS_PAYLOAD_FILE": str(RS_DIR / "protected_resource.txt"),
+    "RS_TEST_FAULTS": "1",
 })
 os.environ.pop("RS_PRM_URL", None)
 # Load by path under a unique name: augmenter/app.py is also called "app", and
@@ -192,6 +193,35 @@ class ProtectedResourceMetadata(unittest.TestCase):
     def test_no_document_at_unrelated_suffix(self):
         r = rs.app.test_client().get("/.well-known/oauth-protected-resource/elsewhere")
         self.assertEqual(r.status_code, 404)
+
+
+class Faults(unittest.TestCase):
+    """The deliberately broken discovery fixtures behind the negative scenarios."""
+
+    def setUp(self):
+        self.c = rs.app.test_client()
+
+    def test_each_fault_has_its_own_protected_url_pointing_at_its_own_prm(self):
+        for name in ("prm-not-covering", "prm-redirect"):
+            r = self.c.get(f"/faults/{name}/vo-resource")
+            self.assertEqual(r.status_code, 401)
+            self.assertEqual(r.headers["WWW-Authenticate"],
+                             f'Bearer resource_metadata="https://src.local.io/faults/{name}/prm"')
+
+    def test_prm_not_covering_describes_a_different_resource(self):
+        doc = self.c.get("/faults/prm-not-covering/prm").get_json()
+        self.assertEqual(doc["resource"], "https://src.local.io/some-other-service")
+        self.assertEqual(doc["authorization_servers"], [ISSUER])
+
+    def test_prm_redirect_redirects_to_the_good_prm(self):
+        r = self.c.get("/faults/prm-redirect/prm")
+        self.assertEqual(r.status_code, 302)
+        self.assertEqual(r.headers["Location"],
+                         "https://src.local.io/.well-known/oauth-protected-resource")
+
+    def test_unknown_fault_is_404(self):
+        self.assertEqual(self.c.get("/faults/nope/vo-resource").status_code, 404)
+        self.assertEqual(self.c.get("/faults/nope/prm").status_code, 404)
 
 
 if __name__ == "__main__":

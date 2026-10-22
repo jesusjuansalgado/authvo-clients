@@ -67,6 +67,9 @@ REQUIRED_SCOPE = os.environ.get("RS_REQUIRED_SCOPE", "vo.read")
 # disable verification in throwaway local demos.
 CA_BUNDLE = os.environ.get("RS_CA_BUNDLE", "")
 PAYLOAD_FILE = os.environ.get("RS_PAYLOAD_FILE", "protected_resource.txt")
+# Test fixtures: when "1", serve deliberately broken discovery under /faults/...
+# (see the end of this file). Off unless the harness turns it on.
+TEST_FAULTS = os.environ.get("RS_TEST_FAULTS") == "1"
 
 app = Flask(__name__)
 _jwks_client = None
@@ -219,6 +222,36 @@ def protected(anything=None):
         mimetype="text/plain; charset=us-ascii",
         headers={"Content-Disposition": 'attachment; filename="protected_resource.txt"'},
     )
+
+
+# --- test fixtures (RS_TEST_FAULTS=1) ----------------------------------------
+# Two deliberately broken discovery set-ups, so the clients' step-2 refusals can be
+# exercised against the real stack. Each fault has its own protected URL
+# (/faults/<name>/vo-resource) whose 401 points at its own PRM (/faults/<name>/prm):
+#
+#   prm-not-covering  the PRM describes a DIFFERENT resource than the one requested
+#                     (RFC 9728 3.3 mismatch) -> the client must abort at step 2
+#   prm-redirect      the PRM URL answers 302 to a perfectly good PRM; a client that
+#                     followed it would succeed, so refusing is the whole test
+FAULT_NAMES = ("prm-not-covering", "prm-redirect")
+
+if TEST_FAULTS:
+    @app.get("/faults/<name>/vo-resource")
+    def fault_resource(name):
+        if name not in FAULT_NAMES:
+            return Response("not found", status=404, mimetype="text/plain")
+        pointer = f"{RESOURCE_ID.rstrip('/')}/faults/{name}/prm"
+        return Response("token not found", status=401, mimetype="text/plain",
+                        headers={"WWW-Authenticate": f'Bearer resource_metadata="{pointer}"'})
+
+    @app.get("/faults/<name>/prm")
+    def fault_prm(name):
+        if name == "prm-redirect":
+            return Response(status=302, headers={"Location": PRM_URL})
+        if name == "prm-not-covering":
+            doc = dict(prm_document(), resource=RESOURCE_ID.rstrip("/") + "/some-other-service")
+            return Response(json.dumps(doc, indent=2) + "\n", mimetype="application/json")
+        return Response("not found", status=404, mimetype="text/plain")
 
 
 @app.get("/healthz")

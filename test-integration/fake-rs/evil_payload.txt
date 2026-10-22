@@ -1,0 +1,4 @@
+*** EVIL SERVICE ***
+If you can read this, a client sent a real bearer token to the wrong place.
+(The evil resource server must never be reached with a token: every client
+should abort at the resource check, before any login.)

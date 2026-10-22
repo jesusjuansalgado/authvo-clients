@@ -8,6 +8,9 @@
 # and, on its own origin (src.local.io):
 #   - resource    (the protected REST interface)      -> the demo closer; it
 #       serves its OWN RFC 9728 Protected Resource Metadata
+# and, on a third origin (evil.local.io), for the negative test:
+#   - evil        (a second fake-rs)                  -> names the real IAM in its
+#       PRM but is not in the IAM's protected_resources, so clients must refuse it
 #
 # Run ./setup.sh first: it generates the *.local.io certs and the Traefik
 # dynamic config, reminds you about /etc/hosts, then `docker compose up`.
@@ -112,6 +115,7 @@ services:
       # resource server, not the IAM, publishes the metadata about itself.
       RS_PRM_URL: "https://src.local.io/.well-known/oauth-protected-resource"
       RS_REQUIRED_SCOPE: "vo.read"
+      RS_TEST_FAULTS: "1"                   # serve the /faults/... discovery fixtures (negative tests)
       RS_CA_BUNDLE: "/certs/local-ca.pem"   # trust the harness origin for JWKS
       # PyJWKClient (pinned PyJWT 2.7.0) fetches the JWKS via urllib, which
       # ignores RS_CA_BUNDLE; point urllib's default TLS context at our CA too.
@@ -131,6 +135,33 @@ services:
       - "traefik.http.routers.rs.entrypoints=websecure"
       - "traefik.http.routers.rs.tls=true"
       - "traefik.http.services.rs.loadbalancer.server.port=8000"
+
+  # --- The "evil" resource server: the negative test --------------------------
+  # A second fake-rs on its OWN origin (evil.local.io). Its 401 points at its own
+  # perfectly well-formed PRM, which names the REAL IAM as the authorization server
+  # -- exactly the "evil service" attack -- but evil.local.io is NOT in the IAM's
+  # protected_resources (augmenter/config/protected_resources.json), so every
+  # client must abort at the resource check, before any login or device code.
+  evil:
+    build: ./fake-rs
+    environment:
+      RS_RESOURCE_ID: "https://evil.local.io"
+      RS_ISSUER: "https://iam.local.io/"    # <- names the real IAM
+      RS_PRM_URL: "https://evil.local.io/.well-known/oauth-protected-resource"
+      RS_REQUIRED_SCOPE: "vo.read"
+      RS_CA_BUNDLE: "/certs/local-ca.pem"
+      SSL_CERT_FILE: "/certs/local-ca.pem"
+      # A payload that makes a leak obvious if a client ever got this far.
+      RS_PAYLOAD_FILE: "/payload/evil_payload.txt"
+    volumes:
+      - ./certs/local-ca.pem:/certs/local-ca.pem:ro
+      - ./fake-rs:/payload:ro
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.evil.rule=Host(`evil.local.io`)"
+      - "traefik.http.routers.evil.entrypoints=websecure"
+      - "traefik.http.routers.evil.tls=true"
+      - "traefik.http.services.evil.loadbalancer.server.port=8000"
 
 volumes:
   trustanchors:
