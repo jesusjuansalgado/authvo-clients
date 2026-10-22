@@ -749,6 +749,9 @@ class AuthVoClient:
 def main(argv: list[str]) -> int:
     """CLI entry point: take a resource URL (arg or AUTHVO_RESOURCE) and run it.
 
+    Exit status: 0 = the resource returned 200; 1 = a check failed, the network
+    failed, or the resource answered with anything else; 2 = usage error.
+
     Environment variables:
       AUTHVO_RESOURCE        the protected-resource URL (if not passed as argv[1])
       AUTHVO_CLIENT_ID       a preconfigured client_id (skips dynamic registration)
@@ -782,7 +785,9 @@ def main(argv: list[str]) -> int:
         return 1
     print("\n--- resource response ---")
     print(resp.text[:2000])
-    return 0
+    # Exit non-zero unless the resource actually handed over its data (a 403 for
+    # a missing scope, say, is a failure even though no check was violated).
+    return 0 if resp.status_code == 200 else 1
 
 
 if __name__ == "__main__":
