@@ -31,6 +31,18 @@ services:
       - ./traefik/traefik.yml:/etc/traefik/traefik.yml:ro
       - ./traefik/dynamic:/etc/traefik/dynamic:ro   # written by setup.sh
       - ./certs:/certs:ro
+    # Start Traefik AFTER the services it routes to are running. Its Docker provider
+    # lists the running containers once at start-up and then follows start events; a
+    # backend that only starts in between can be missed, leaving that router
+    # unregistered (every path for it then answers Traefik's bare "404 page not
+    # found" until the proxy is restarted). Ordering the start so the backends are
+    # already running removes that window. (A mitigation: the race is rare and could
+    # not be reproduced on demand; provision.sh also diagnoses it.)
+    depends_on:
+      - iam
+      - augmenter
+      - resource
+      - evil
     networks:
       default:
         aliases:
