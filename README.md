@@ -244,6 +244,9 @@ the internal network, adds one member, and returns everything else unchanged
 > note. Delete the `augmenter` service and its Traefik router as soon as INDIGO IAM
 > publishes `protected_resources` natively.**
 
+> The demo wires this up for you. For a **real deployment** — how an operator makes
+> their own IAM publish `protected_resources` — see §14.
+
 ### 6.3 Routing on the IAM origin (Traefik)
 
 The augmenter answers exactly the two metadata paths, with a **higher router
@@ -581,6 +584,7 @@ the client processes only.
 | Client aborts: *STEP 2 FAILED … does not cover the requested URL* | The PRM's `resource` (`RS_RESOURCE_ID`) doesn't cover the URL you asked for (§2). |
 | Client aborts: *refusing to follow redirects* | A discovery URL answered 3xx. Clients never follow redirects; fix the URL (the PRM pointer, the issuer in the PRM). |
 | Client aborts: *check (a): metadata issuer … != the issuer named by the PRM* | `RS_ISSUER` and the IAM's `IAM_ISSUER` differ (mind the trailing slash). |
+| Clients abort with *the issuer publishes no protected_resources* although `augmenter/config/protected_resources.json` has content, and `docker exec <augmenter> ls /config` shows nothing | A **stale directory bind mount**: the host directory was deleted and re-created while the stack was up (typically by `git checkout` to a commit without `augmenter/`, or `git clean`), and the container still points at the old, deleted one. `docker compose up -d --force-recreate augmenter`. |
 | `augmenter` returns `502` | The IAM isn't up yet (or is down); it proxies the IAM's live metadata. |
 | `evil.local.io` doesn't resolve / TLS error for it | Add it to `/etc/hosts` (§5); re-run `./setup.sh` so the leaf certificate covers it. |
 | Client TLS: *CA cert does not include key usage extension* | Regenerate certs with the X.509 extensions (§8). |
@@ -650,3 +654,171 @@ fetch is merged into it), `_step3_fetch_sidecar` → `_step2_prm`; the same in
 | `fake-rs` requires `aud == its id` | checks `aud` **when present**; token exchange no longer needed |
 | — | **evil** resource server on `evil.local.io` + negative scenarios; `evil.local.io` in the cert SANs and `/etc/hosts` |
 | — | offline tests and the live scenario runner (`test-integration/tests/`) |
+
+---
+
+## 14. Operating it for real: publishing `protected_resources` on your IAM
+
+§6 shows the mechanism inside the demo. This section is for **running AuthVO against
+your own IAM**: what you have to put in place, in what order, and how to check it.
+
+### 14.0 What this does — and does not — change
+
+**INDIGO IAM itself is not modified, and cannot be configured to do this.** We checked
+the pinned release (v1.10.0) directly: its discovery document
+(`/.well-known/openid-configuration`, 34 members) has no `protected_resources`; it
+serves no RFC 8414 document at `/.well-known/oauth-authorization-server` (404); and the
+string `protected_resources` appears nowhere in the IAM's own compiled code (its 970 classes
+and two `iam-*` jars; a search for a member it does publish, `device_authorization_endpoint`,
+does find it). So the member is added **on
+the way out** by a small reverse proxy — the *augmenter* (`test-integration/augmenter/`)
+— that sits in front of exactly those two documents:
+
+```
+client ──TLS──▶  your TLS front door (nginx / Traefik / …)
+                   ├─ /.well-known/oauth-authorization-server ─┐
+                   ├─ /.well-known/openid-configuration ───────┤──▶ augmenter ──▶ IAM (live metadata)
+                   └─ everything else ─────────────────────────────────────────▶ IAM
+```
+
+The augmenter fetches the IAM's *live* metadata, adds `protected_resources`, and returns
+the rest unchanged — above all `issuer`. If the IAM has no RFC 8414 document it derives
+one from OIDC discovery. A client cannot tell the result from native support, so when
+INDIGO eventually publishes the member you remove the augmenter and nothing else
+changes (§14.5).
+
+### 14.1 What you are publishing — and who may change it
+
+`protected_resources` is the list of resource identifiers **your IAM vouches for**. It
+is the half of the trust decision that the *resource server cannot forge*: a client
+refuses a resource whose issuer does not list it (§2, step 3). That makes the list a
+**trust anchor**. Whoever can edit it decides which services clients will let this IAM
+issue tokens for. Treat it like the IAM's own configuration: keep it in version control,
+restrict who can change it, and review changes.
+
+### 14.2 Step by step
+
+**1. Decide the identifiers.** One per protected service, normally its origin or a path
+prefix, written exactly as that service publishes it as the `resource` of its own PRM
+(§6.1). A request URL is *covered* by an identifier if it is equal to it or extends it at a
+path-segment boundary (§2), so `https://data.example.org` covers every URL on that
+service, whereas `https://data.example.org/tap` covers `/tap/async/1` but not `/tapx`.
+Prefer service-level identifiers over deep URLs.
+
+**2. Put them in the augmenter's config file** (`protected_resources.json`):
+
+```json
+{
+  "protected_resources": [
+    "https://data.example.org",
+    "https://archive.example.org/vo"
+  ]
+}
+```
+
+**3. Run the augmenter** next to the IAM, on an internal network. It is a single
+standard-library Python file (`augmenter/app.py`, image built from `augmenter/Dockerfile`),
+configured by environment variables:
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `AUGMENTER_UPSTREAM` | `http://iam:8080` | Where the IAM listens, on the internal network |
+| `AUGMENTER_UPSTREAM_HOST` | `iam.local.io` | The IAM's **public** host name. Sent as `Host` / `X-Forwarded-Host` (with `X-Forwarded-Proto: https`) so the IAM writes its public URLs into its metadata. The IAM must honour forwarded headers, as it already must behind your proxy (the demo sets `IAM_USE_FORWARDED_HEADERS=true`) |
+| `AUGMENTER_CONFIG` | `/config/protected_resources.json` | The list above. **Mount the directory, not the single file** (editors that replace a file on save leave a single-file bind mount stale) |
+| `AUGMENTER_CACHE_SECONDS` | `60` | How long the IAM's own metadata is cached. The config file is **not** cached: it is read on every request |
+| `PORT` | `8080` | Listen port; `GET /healthz` answers `200` for health checks |
+
+**4. Route exactly those two paths to it**, leaving every other IAM path alone. The two
+rules are the whole integration. With **Traefik** (the demo's set-up; the router must beat
+the IAM's own, hence the priority):
+
+```yaml
+- "traefik.http.routers.augmenter.rule=Host(`iam.example.org`) && (Path(`/.well-known/oauth-authorization-server`) || Path(`/.well-known/openid-configuration`))"
+- "traefik.http.routers.augmenter.priority=100"
+- "traefik.http.services.augmenter.loadbalancer.server.port=8080"
+```
+
+With **nginx** (tested against the demo stack with the TLS part left out; add your usual
+`listen 443 ssl` and certificates). Exact-match `location =` blocks take precedence over
+the prefix block:
+
+```nginx
+server {
+    listen 80;
+    server_name iam.example.org;
+
+    location = /.well-known/oauth-authorization-server { proxy_pass http://augmenter:8080; }
+    location = /.well-known/openid-configuration       { proxy_pass http://augmenter:8080; }
+
+    location / {
+        proxy_pass http://iam:8080;
+        proxy_set_header Host              $host;
+        proxy_set_header X-Forwarded-Proto https;
+        proxy_set_header X-Forwarded-Host  $host;
+        proxy_set_header X-Forwarded-For   $proxy_add_x_forwarded_for;
+    }
+}
+```
+
+**5. Make each resource server consistent with the list.** Its PRM (§6.1) must say
+`resource` = one of the identifiers you listed (or one that is covered by an entry) and
+`authorization_servers` = your issuer **exactly as the IAM writes it** (mind the trailing
+slash: `https://iam.example.org/` is not `https://iam.example.org`), and its 401 challenge
+must point at that PRM. It checks `iss`, scope, expiry and — when present — `aud`.
+
+**6. Verify**, from outside, with nothing but `curl` and `jq`:
+
+```bash
+# both documents carry the member, and the issuer is untouched
+curl -s https://iam.example.org/.well-known/oauth-authorization-server | jq '{issuer, protected_resources}'
+curl -s https://iam.example.org/.well-known/openid-configuration       | jq '{issuer, protected_resources}'
+
+# a resource server and the issuer agree about each other
+jq -n --argjson prm "$(curl -s https://data.example.org/.well-known/oauth-protected-resource)" \
+      --argjson as  "$(curl -s https://iam.example.org/.well-known/oauth-authorization-server)" \
+  '{resource: $prm.resource,
+    issuer_matches:  ($as.issuer == $prm.authorization_servers[0]),
+    resource_listed: ((($as.protected_resources // []) | index($prm.resource)) != null)}'
+```
+
+Both of the last two fields must be `true` for every resource server (in the demo,
+`src.local.io` gives `true, true` and the evil server `true, false`). Then run a real
+client end to end: `python authvo_client.py https://data.example.org/<a protected URL>`.
+Finally check the *negative* case — an unlisted resource must be refused before any login
+(the demo's scenario 2 does this; §10).
+
+### 14.3 Day-2 operations
+
+* **Add or remove a resource:** edit the JSON file. It takes effect on the next request;
+  no restart. (The IAM's own metadata is cached for `AUGMENTER_CACHE_SECONDS`; the list is not.)
+* **It fails closed.** If the file is missing, unreadable or malformed the member is simply
+  **omitted** (the augmenter logs why) and clients refuse everything: they treat an absent
+  list as a failure. An empty list refuses everything too.
+* **If the IAM is down** the augmenter returns `502`, except that a cached copy of the IAM's
+  metadata is served for up to a minute.
+* **Scaling and HA:** the service is stateless; run as many replicas as you like behind the
+  same route. It only serves `GET` of the two metadata paths and `/healthz` (other paths answer `404`;
+other HTTP methods are not supported).
+* **After editing files from git** (checkout, clean) while the stack is running, recreate the
+  container, because a directory bind mount can go stale (§11).
+
+### 14.4 Limits, and hardening
+
+* **The issuer must live at the root of its host** (`https://iam.example.org/`). The augmenter
+  serves the two root well-known paths. For an issuer *with a path* (`https://host/iam`),
+  RFC 8414 puts the document at `/.well-known/oauth-authorization-server/iam` and OIDC at
+  `/iam/.well-known/openid-configuration`; the augmenter's two path constants and your routes
+  would have to change accordingly.
+* **One IAM per augmenter instance** (`AUGMENTER_UPSTREAM_HOST` is a single value).
+* It is a reference implementation on Python's standard-library HTTP server. It does not
+  terminate TLS and should sit behind your TLS front door, on an internal network, not be
+  exposed directly. The shipped `Dockerfile` runs as root; add a `USER` line for production.
+* Publish only what you mean to: the list is world-readable by design.
+
+### 14.5 Retiring the augmenter
+
+When a future INDIGO release publishes `protected_resources` itself, you will see the member in
+the IAM's **own** document (check it directly, bypassing the augmenter). Until then the
+augmenter is harmless to leave in place: **if the upstream document already contains the
+member it is passed through untouched** — native support wins. Once you have confirmed it,
+delete the augmenter service and the two routes; no client or resource server changes.
