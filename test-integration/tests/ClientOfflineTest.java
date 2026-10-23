@@ -275,6 +275,36 @@ public class ClientOfflineTest {
             eq("https://h/iam/.well-known/openid-configuration", AuthVoClient.asMetadataUrls("https://h/iam")[1]);
         });
 
+        System.out.println("step 5 - token response must be a Bearer access token");
+        for (String t : new String[] {"Bearer", "bearer", "BEARER"})
+            test("accepts token_type " + t, () ->
+                    AuthVoClient.requireBearer(M.readTree("{\"access_token\":\"abc\",\"token_type\":\"" + t + "\"}"), "t"));
+        for (String bad : new String[] {
+                "{\"access_token\":\"abc\",\"token_type\":\"DPoP\"}",
+                "{\"access_token\":\"abc\",\"token_type\":\"N_A\"}",
+                "{\"access_token\":\"abc\",\"token_type\":\"\"}",
+                "{\"access_token\":\"abc\"}",
+                "{\"access_token\":\"abc\",\"token_type\":5}"})
+            test("rejects " + bad, () -> {
+                try {
+                    AuthVoClient.requireBearer(M.readTree(bad), "t");
+                } catch (AuthVoClient.SecurityException e) {
+                    if (!e.getMessage().contains("token_type")) throw new AssertionError(e.getMessage());
+                    return;
+                }
+                throw new AssertionError("expected a SecurityException");
+            });
+        for (String bad : new String[] {"{\"token_type\":\"Bearer\"}", "{\"access_token\":\"\",\"token_type\":\"Bearer\"}"})
+            test("rejects a missing or empty access token: " + bad, () -> {
+                try {
+                    AuthVoClient.requireBearer(M.readTree(bad), "t");
+                } catch (AuthVoClient.SecurityException e) {
+                    if (!e.getMessage().contains("no access_token")) throw new AssertionError(e.getMessage());
+                    return;
+                }
+                throw new AssertionError("expected a SecurityException");
+            });
+
         System.out.println("\n" + (ran - failures) + "/" + ran + " passed");
         System.exit(failures == 0 ? 0 : 1);
     }

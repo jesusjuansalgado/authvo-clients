@@ -10,12 +10,12 @@
 //   1. GET the resource anonymously (no redirects) -> 401 + a pointer to the
 //      resource server's own Protected Resource Metadata (PRM). UNTRUSTED.
 //   2. fetch the PRM; ABORT unless its `resource` COVERS the URL we asked for
-//                                                      (RFC 9728 s3, s3.3)
+//                                                      (RFC 9728 s3; AuthVO draft 3.3.1)
 //   3. RESOURCE CHECK -- the security gate. A resource server can claim any issuer,
 //      so ask the ISSUER: its own RFC 8414 metadata must (a) carry the issuer the
 //      PRM named and (b) list this resource in `protected_resources` (an absent
 //      list aborts). This stops the "evil service", BEFORE any login.
-//                                                      (RFC 8414 s3.3, RFC 9728 s4)
+//                                                      (RFC 8414 s3.3; RFC 9728 s4, mandatory in the AuthVO draft)
 //   4. client id (registered by provision.sh)
 //   5. device authorization grant (human logs in), poll the token endpoint with
 //      resource=<matched id> (RFC 8707); --token-exchange also narrows it (RFC 8693)
@@ -119,7 +119,7 @@ public class Demo {
                 if (!candidate.equals(jsonStr(doc, "issuer")))
                     throw new Abort("check (a): metadata issuer '" + jsonStr(doc, "issuer")
                             + "' != the issuer '" + candidate + "' named by the PRM");
-                // (b) the issuer must list the resource (RFC 9728 4); absent == failure
+                // (b) the issuer must list the resource (RFC 9728 4; mandatory per the AuthVO draft); absent == failure
                 List<String> listed = jsonStrArray(doc, "protected_resources");
                 if (!hasKey(doc, "protected_resources"))
                     throw new Abort("check (b): the issuer publishes no protected_resources "

@@ -7,11 +7,12 @@ are a deliberately plain port of the checks in the real client (authvo_client.py
 which is the reference): same rules, same RFC references.
 
   Step 1  probe: 401 + a `resource_metadata` pointer (UNTRUSTED)       RFC 9728 s5
-  Step 2  PRM from the resource server must COVER the requested URL    RFC 9728 s3, 3.3
+  Step 2  PRM from the resource server must COVER the requested URL    RFC 9728 s3; AuthVO 3.3.1
   Step 3  resource check on the ISSUER's own RFC 8414 metadata:
             (a) its `issuer` == the issuer the PRM named               RFC 8414 s3.3
-            (b) `protected_resources` present AND covering the URL     RFC 9728 s4
-  Every metadata fetch refuses redirects.
+            (b) `protected_resources` present AND covering the URL     RFC 9728 s4; AuthVO 3.3.1
+  Every metadata fetch refuses redirects. (Coverage instead of the exact match of RFC 9728
+3.3, and a MANDATORY protected_resources, are the AuthVO draft's profile, 3.3.1.)
 
 Anything that fails raises Abort: the demo prints the reason and stops, before the
 user is ever asked to log in.
@@ -137,7 +138,7 @@ def check_a(as_doc, issuer):
 
 
 def check_b(as_doc, resource_url):
-    """Check (b): the issuer lists the resource (RFC 9728 4). Returns the matched id.
+    """Check (b): the issuer lists the resource (RFC 9728 4; mandatory in the AuthVO draft). Returns the matched id.
     An ABSENT list is a failure, not a pass."""
     listed = as_doc.get("protected_resources")
     if listed is None:

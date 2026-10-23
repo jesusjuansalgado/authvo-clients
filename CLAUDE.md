@@ -22,7 +22,8 @@ obtaining a real token for it. The agreed direction — as revised by
   boundary).
 - The binding between resource and issuer is checked from the **issuer's** side
   (the **resource check**): its RFC 8414 metadata must carry the same `issuer` the
-  PRM named *and* list the resource in **`protected_resources`** (RFC 9728 §4).
+  PRM named *and* list the resource in **`protected_resources`** (RFC 9728 §4 defines it as
+  optional; the AuthVO draft §3.3.1 makes it mandatory).
   An **absent** list is a failure, not a pass. This happens before any login.
 - The client uses the device grant and sends `resource=<matched id>` (RFC 8707).
   RFC 8693 token exchange is **optional, off by default**. The resource server
@@ -55,6 +56,10 @@ obtaining a real token for it. The agreed direction — as revised by
 - **Don't reintroduce "IAM and the PRM must share an origin".** That was the old
   domain-proxy design. The security argument is the resource check (above), not
   where a document is hosted.
+- **RFC conformance:** coverage instead of RFC 9728 §3.3's exact match, a mandatory
+  `protected_resources` and `aud`-only-when-present are *deliberate AuthVO-profile departures*
+  (README §15). Never cite RFC 9728 §3.3 as the basis of the coverage rule, and RFC 9207
+  does not apply to the device grant.
 - The two clients must stay behaviourally identical; the URL-coverage rules are
   pinned for both by `test-integration/tests/coverage_vectors.json`.
 
