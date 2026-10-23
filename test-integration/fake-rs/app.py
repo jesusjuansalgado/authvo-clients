@@ -230,7 +230,7 @@ def protected(anything=None):
 # (/faults/<name>/vo-resource) whose 401 points at its own PRM (/faults/<name>/prm):
 #
 #   prm-not-covering  the PRM describes a DIFFERENT resource than the one requested
-#                     (RFC 9728 3.3 mismatch) -> the client must abort at step 2
+#                     (fails the coverage check, AuthVO 3.3.1) -> the client must abort at step 2
 #   prm-redirect      the PRM URL answers 302 to a perfectly good PRM; a client that
 #                     followed it would succeed, so refusing is the whole test
 FAULT_NAMES = ("prm-not-covering", "prm-redirect")

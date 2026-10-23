@@ -250,6 +250,35 @@ class Step3ResourceCheck(unittest.TestCase):
         self.assertAborts(good_routes(), "HTTPS", "http://iam.local.io/")
 
 
+class BearerCheck(unittest.TestCase):
+    """The AuthVO draft (5.4.5): the client MUST verify the response carries an access
+    token and that it is of type Bearer (RFC 6749 7.1: the type is case-insensitive)."""
+
+    def check(self, doc):
+        ac.AuthVoClient._require_bearer(doc, "access token")
+
+    def test_accepts_bearer_in_any_case(self):
+        for t in ("Bearer", "bearer", "BEARER"):
+            self.check({"access_token": "abc", "token_type": t})
+
+    def test_rejects_other_token_types(self):
+        for t in ("DPoP", "mac", "N_A", "", None, 123):
+            with self.subTest(token_type=t):
+                with self.assertRaisesRegex(ac.SecurityError, "token_type"):
+                    self.check({"access_token": "abc", "token_type": t})
+
+    def test_rejects_a_missing_token_type(self):
+        with self.assertRaisesRegex(ac.SecurityError, "token_type"):
+            self.check({"access_token": "abc"})
+
+    def test_rejects_a_missing_or_empty_access_token(self):
+        for doc in ({"token_type": "Bearer"}, {"access_token": "", "token_type": "Bearer"},
+                    {"access_token": None, "token_type": "Bearer"}):
+            with self.subTest(doc=doc):
+                with self.assertRaisesRegex(ac.SecurityError, "no access_token"):
+                    self.check(doc)
+
+
 class TokenExchangeOptional(unittest.TestCase):
     """Token exchange (RFC 8693) is opt-in; DCR only asks for grants it will use."""
 

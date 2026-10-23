@@ -8,7 +8,7 @@ as the authorization server.
 This repository contains:
 
 * two **reference client implementations** (Python and Java) of the AuthVO flow,
-  which follows RFC 9728 (see §13 for what changed with
+  which follows RFC 9728 with the departures listed in §15 (see §13 for what changed with
   [AuthVO issue #22](https://github.com/ivoa-std/AuthVO/issues/22)), and
 * a **local integration harness** (`test-integration/`) that stands up a real
   INDIGO IAM, a metadata *augmenter* that emulates the one thing INDIGO does not
@@ -26,17 +26,21 @@ token may be sent to. A malicious resource server (the "evil service") can name 
 obtaining a real token for it, then capture that token.
 
 The AuthVO direction (from the IVOA DSP *Bearer Tokens — Open Issues* deck, as
-revised by issue #22) follows [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728):
+revised by issue #22) follows [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728), with the
+departures listed in §15:
 
 * The resource server's `401` returns **only a pointer** (`resource_metadata`) to
   its **own** Protected Resource Metadata (PRM) document, which it publishes at
   its own well-known URL. The pointer is untrusted; the client only accepts a PRM
-  whose `resource` **covers the URL it asked for**.
+  whose `resource` **covers the URL it asked for**. (RFC 9728 §3.3 asks for an *exact*
+  match; coverage is the AuthVO draft's deliberate relaxation, so one identifier can govern
+  a whole service.)
 * But a resource server can say anything about itself, including "my issuer is
   the real IAM". So the binding is checked **from the other side**: the
   authorization server's own RFC 8414 metadata must name the same issuer **and
   list the resource in `protected_resources`**
-  ([RFC 9728 §4](https://www.rfc-editor.org/rfc/rfc9728#section-4)). Only the
+  ([RFC 9728 §4](https://www.rfc-editor.org/rfc/rfc9728#section-4), where it is
+  *optional*; the AuthVO draft makes it mandatory). Only the
   issuer can vouch for which resources it serves. If it publishes no such list
   the client refuses: **absence is a failure, not a pass.** This *resource check*
   happens before the user is asked to log in.
@@ -891,3 +895,53 @@ the IAM's **own** document (check it directly, bypassing the augmenter). Until t
 augmenter is harmless to leave in place: **if the upstream document already contains the
 member it is passed through untouched** — native support wins. Once you have confirmed it,
 delete the augmenter service and the two routes; no client or resource server changes.
+
+---
+
+## 15. Conformance with the RFCs and with the AuthVO draft
+
+This section records where the reference clients and the harness follow the standards,
+where they depart from them **on purpose** (the AuthVO profile), and how they stand against
+the draft. It was checked against the text of the AuthVO working draft with the issue #22
+changes (*Authentication in the Virtual Observatory*, IVOA Working Draft 2025-05-27, revision
+`eb70373-dirty`, 2026-10-09) and, for RFC 9728, RFC 8707 and RFC 9068, against the RFC texts.
+The other RFCs below are as implemented and were **not** re-read for this review.
+
+### 15.1 Followed as specified
+
+| Standard | What | Where |
+|----------|------|-------|
+| RFC 9728 §2, §3.1, §3.2 | PRM members (`resource`, `authorization_servers`, `scopes_supported`, `bearer_methods_supported`); well-known URL with the suffix inserted between host and path; `200` JSON | `fake-rs`; `test_fake_rs.py` |
+| RFC 9728 §5.1 | `WWW-Authenticate: Bearer resource_metadata="…"` in the `401` | `fake-rs`, both clients |
+| RFC 9728 §4 | `protected_resources` as an authorization-server metadata member (as *defined*; see 15.2 for its status) | augmenter |
+| RFC 8414 §3.1, §3.3 | metadata URL construction (issuer with or without a path); `issuer` identical to the one named | both clients (check (a)) |
+| RFC 8707 §2, §2.2 | `resource` on the token request (§2.2: all grant types); the most specific identifier | both clients |
+| RFC 6750 | no error code when no token is sent; `invalid_token` for a bad one; `403 insufficient_scope` | `fake-rs` |
+| RFC 8628, RFC 7591, RFC 8693 | device grant (polling, `authorization_pending`, `slow_down`); dynamic registration of a public client; optional exchange | both clients |
+
+### 15.2 Deliberate departures from the RFCs (the AuthVO profile)
+
+These are choices of the AuthVO draft (§3.3.1, §5.4), not accidents. Each has a consequence.
+
+| # | RFC | AuthVO profile (and these clients) | Consequence |
+|---|-----|------------------------------------|-------------|
+| 1 | **RFC 9728 §3.3**: the PRM `resource` must be *identical* to the identifier the metadata URL was built from, and, for a URL taken from a challenge, must match the URL the client requested; otherwise the data must not be used | the PRM `resource` must **cover** the requested URL (same origin, path equal or extending it at a segment boundary), so one identifier governs a service with variable paths (draft §3.3.1: "relaxes the exact match") | **A client that follows RFC 9728 to the letter would reject this PRM for a deep URL.** Interoperability with generic RFC 9728 clients needs the profile |
+| 2 | **RFC 9728 §4**: `protected_resources` is *optional*, and the RFC does not say how a client uses it | **mandatory**; an absent list is a failure (draft §3.3.1, §5.4.3) | Issuers that do not publish it (INDIGO 1.10) need the augmenter, or clients refuse them |
+| 3 | RFCs silent on redirects | no redirect is followed on any discovery request, the token endpoint, or the bearer request (the draft requires it for the PRM and the AS metadata) | stricter than the draft |
+| 4 | **RFC 9068 §4**: a resource server must reject a JWT whose `aud` does not include itself (RFC 8707 §2: the AS should audience-restrict) | the resource server checks `aud` **only when present** (draft §5.4.6) | INDIGO 1.10 issues tokens **without `aud`**, so a leaked token is replayable at any resource the issuer lists, unless the optional token exchange is used (§7.4) |
+| 5 | RFC 9068 §2.1/§4: `typ` header `at+jwt` | not checked | INDIGO 1.10's access tokens carry no `typ` (observed) |
+
+### 15.3 The implementation against the draft
+
+| Draft requirement | Status |
+|-------------------|--------|
+| §5.4.1–5.4.3: HTTPS; pointer untrusted; PRM `resource` covers the URL, else abort; AS metadata (RFC 8414) without redirects; (a) `issuer` equal, (b) `protected_resources` present and covering, else abort **before any login**; the RFC 8414 document is the one used; first passing issuer wins | ✅ both clients; every abort path tested, live (scenarios 2–5) |
+| §5.4.4: dynamic registration as a public client; grant types limited to the device grant | ✅ |
+| §5.4.5: show the resource **and** the issuer; `resource` on the token request; **verify an access token is present and of type Bearer** | ✅ — the `token_type` check was **missing** and was added with this section (case-insensitive, RFC 6749 §7.1), with tests in both languages |
+| §5.4.6: the resource server validates signature, `iss`, scope, expiry, and `aud` when present | ✅ `fake-rs` |
+| §5.4.7: refresh, re-sending the same `resource` | ⛔ not implemented (a MAY); the clients also do not request `offline_access` |
+| §5.4.3: if an authorization *response* carries an issuer (RFC 9207), it must match | ➖ not applicable: the device grant has no authorization response. The clients' `iss` check is a sanity check on the token's own claim (RFC 7519 §4.1.1), not RFC 9207 |
+| §3.3.1: the AS **publishes** `protected_resources` (also in the OIDC document, as a SHOULD) | ✅ via the augmenter, which adds it to both documents |
+| §3.3.1: the AS **SHOULD reject** a `resource` it does not list (RFC 8707 `invalid_target`) | ❌ INDIGO 1.10 does not: it issued the same token for a listed, an unlisted and an absent `resource` (checked) |
+| §3.3.1: the AS **SHOULD restrict the audience** to the requested resource | ❌ INDIGO 1.10 issues no `aud`; ✅ with the optional token exchange |
+| §3.3.1 note: the proxy "retrieves the server's live RFC 8414 metadata" | ➕ INDIGO 1.10 serves **no** RFC 8414 document (`404`); the augmenter derives one from its OIDC document (§6.2) |

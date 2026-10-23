@@ -40,7 +40,8 @@ import java.util.regex.Pattern;
  *       so the binding is verified from the other side: the AUTHORIZATION
  *       SERVER's own RFC 8414 metadata must (a) carry the very issuer the PRM
  *       named and (b) list the requested resource in {@code protected_resources}
- *       (RFC 9728 section 4). An issuer that publishes no list is refused: absence
+ *       (RFC 9728 section 4 defines it as optional; the AuthVO draft, 3.3.1, makes
+ *       it mandatory). An issuer that publishes no list is refused: absence
  *       is a failure, not a pass. All of this happens BEFORE any user login.</li>
  * </ol>
  * The token request then carries the matched resource as an RFC 8707
@@ -53,11 +54,11 @@ import java.util.regex.Pattern;
  *   1  GET the protected resource anonymously (NO redirects). Expect
  *      401 + WWW-Authenticate: Bearer resource_metadata="..."   (UNTRUSTED pointer)
  *   2  GET the PRM at that pointer over HTTPS (NO redirects). ABORT unless the PRM
- *      resource covers the requested URL.                        (RFC 9728 3, 3.3)
+ *      resource covers the requested URL.               (RFC 9728 3; AuthVO 3.3.1)
  *   3  RESOURCE CHECK (ABORT before any login on failure): for an issuer named in
  *      the PRM, GET its RFC 8414 metadata (NO redirects) and require
  *        (a) metadata issuer == the issuer the PRM named          (RFC 8414 3.3)
- *        (b) protected_resources present AND covering our URL     (RFC 9728 4)
+ *        (b) protected_resources present AND covering our URL     (RFC 9728 4; AuthVO 3.3.1)
  *      The first listed issuer that passes both is used.
  *   4  Client registration: preconfigured client_id, else RFC 7591 DCR.
  *   5  Token: device authorization (RFC 8628) -> user logs in (we show the
@@ -71,6 +72,22 @@ import java.util.regex.Pattern;
  * with a path that extends it at a path-SEGMENT boundary. So
  * {@code https://h/vo} covers {@code https://h/vo/tap/async/1} but not
  * {@code https://h/vocab}; a root identifier covers its whole origin.
+ *
+ * <h2>Where this profile departs from the RFCs (deliberately; see README section 15)</h2>
+ * <ul>
+ *   <li>RFC 9728 3.3 asks for the PRM {@code resource} to be IDENTICAL to the identifier
+ *       the metadata URL was built from (or to the URL requested). The AuthVO draft
+ *       (3.3.1) relaxes this to COVERAGE so that one identifier can govern a service
+ *       whose endpoints have variable paths; a client following RFC 9728 to the letter
+ *       would reject such a PRM for a deep URL.</li>
+ *   <li>RFC 9728 4 makes {@code protected_resources} OPTIONAL; the AuthVO draft makes it
+ *       MANDATORY (absent = failure).</li>
+ *   <li>No redirect is ever followed (the RFCs are silent; this is stricter).</li>
+ *   <li>The resource server checks {@code aud} only WHEN PRESENT; RFC 9068 4 would require
+ *       it. INDIGO IAM 1.10 issues tokens without one (observed).</li>
+ *   <li>RFC 9207 does not apply: it covers the iss parameter of authorization responses,
+ *       which the device grant does not have.</li>
+ * </ul>
  *
  * <p>Build/run: see pom.xml and README.md (depends on Jackson, JDK 11+).
  */
@@ -215,10 +232,10 @@ public class AuthVoClient {
     /**
      * Step 2: fetch the PRM and require that it describes the resource we asked for.
      * RFC 9728 section 3: the PRM is a JSON document published BY THE RESOURCE SERVER;
-     * we fetch it over HTTPS, refusing redirects. Per section 3.3 the {@code resource}
-     * it declares must be consistent with the resource being accessed -- here it must
-     * COVER the requested URL ({@link #isCovered}). A PRM about some other resource is
-     * useless to us and a sign of spoofing, so we abort.
+     * we fetch it over HTTPS, refusing redirects. Then the {@code resource} it declares
+     * must COVER the requested URL ({@link #isCovered}). RFC 9728 3.3 itself asks for an
+     * exact match; coverage is the AuthVO draft's relaxation (3.3.1, 5.4.2). A PRM about
+     * some other resource is useless to us and a sign of spoofing, so we abort.
      */
     private Prm step2Prm(String resourceUrl, String pointer) throws Exception {
         requireHttps(pointer, "PRM pointer");
@@ -247,7 +264,8 @@ public class AuthVoClient {
      * each issuer it names we fetch THAT ISSUER's own RFC 8414 metadata and require,
      * before any user login: (a) metadata {@code issuer} equals the issuer the PRM named
      * (RFC 8414 3.3), and (b) {@code protected_resources} is present and one entry covers
-     * our URL (RFC 9728 4). The first issuer that passes both is used; if none does we
+     * our URL (RFC 9728 4 makes the member optional; AuthVO 3.3.1 makes it mandatory).
+     * The first issuer that passes both is used; if none does we
      * abort with every reason. An ABSENT {@code protected_resources} is a failure.
      */
     private ResourceCheck step3ResourceCheck(String resourceUrl, Prm prm) throws Exception {
@@ -446,6 +464,7 @@ public class AuthVoClient {
                     .POST(HttpRequest.BodyPublishers.ofString(encode(form))));
             JsonNode doc = json.readTree(r.body());
             if (r.statusCode() == 200) {
+                requireBearer(doc, "access token");    // the draft (5.4.5): present and Bearer
                 validateIssuer(doc, meta.issuer, "access token");
                 log("        -> access token acquired");
                 logAud(doc, "access token");
@@ -480,6 +499,7 @@ public class AuthVoClient {
         form.put("resource", resourceId);              // RFC 8707, belt-and-braces
         form.put("scope", exchangeScope);
         JsonNode doc = postForm(meta.tokenEndpoint, form);
+        requireBearer(doc, "exchanged token");
         validateIssuer(doc, meta.issuer, "exchanged token");
         logAud(doc, "exchanged token");
         return doc;
@@ -554,8 +574,9 @@ public class AuthVoClient {
     /**
      * Is {@code url} covered by the resource identifier {@code resourceId}? Covered means
      * the same origin and a path equal to the identifier's or extending it AT A
-     * PATH-SEGMENT BOUNDARY (RFC 9728 3.3 compares a resource with the URL it was found
-     * for; AuthVO extends that to deep URLs under one service-level identifier).
+     * PATH-SEGMENT BOUNDARY. This is the AuthVO draft's rule (3.3.1): RFC 9728 3.3 asks
+     * for IDENTITY between the PRM's resource and the URL, and AuthVO relaxes that to
+     * coverage so that one service-level identifier governs deep URLs.
      * {@code https://h} covers every path on that origin; {@code https://h/vo} covers
      * /vo and /vo/tap/async/1 but NOT /vocab and NOT /vo/../other.
      */
@@ -612,6 +633,19 @@ public class AuthVoClient {
         return out;
     }
 
+    /**
+     * The AuthVO draft (5.4.5) says the client MUST verify that an access token is present
+     * and of type Bearer. RFC 6749 7.1: the token type is case-insensitive.
+     */
+    static void requireBearer(JsonNode doc, String what) {
+        String token = text(doc, "access_token");
+        if (isBlank(token))
+            throw new SecurityException(what + ": the response carries no access_token");
+        String type = text(doc, "token_type");
+        if (type == null || !type.equalsIgnoreCase("Bearer"))
+            throw new SecurityException(what + ": token_type is " + type + ", expected Bearer");
+    }
+
     /** Log a JWT token's aud for information. Never fails, never decides. */
     private void logAud(JsonNode doc, String what) {
         Map<String, Object> payload = jwtPayload(doc.path("access_token").asText(""));
@@ -621,7 +655,9 @@ public class AuthVoClient {
     }
 
     /**
-     * Client-side issuer cross-check (RFC 9207 spirit): if the token RESPONSE or the JWT
+     * Client-side issuer sanity check on the token's own iss claim (RFC 7519 4.1.1; RFC 9207
+     * covers authorization responses, which the device grant lacks): if the token RESPONSE
+     * or the JWT
      * itself names an issuer, it MUST equal the issuer we trusted. A cheap early sanity
      * check; the resource server does the authoritative binding verification.
      */

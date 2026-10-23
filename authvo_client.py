@@ -25,7 +25,8 @@ AuthVO closes that hole with two independent checks, both implemented below:
      is the real IAM". So the binding is checked from the OTHER side (step 3):
      the AUTHORIZATION SERVER's own RFC 8414 metadata must (a) carry the very
      issuer the PRM named, and (b) list the requested resource in its
-     `protected_resources` member (RFC 9728 section 4). Only the issuer can vouch
+     `protected_resources` member (RFC 9728 section 4 defines it as optional; the
+     AuthVO draft, 3.3.1, makes it mandatory). Only the issuer can vouch
      for which resources it serves; a resource claiming an issuer that does not
      list it is refused BEFORE the user is asked to log in. An issuer that
      publishes no such list is refused too: absence is a failure, not a pass.
@@ -41,11 +42,11 @@ THE FLOW, STEP BY STEP (numbers match the methods below)
   1  GET the protected resource anonymously (NO redirects). Expect
      401 + WWW-Authenticate: Bearer resource_metadata="<url>"   (UNTRUSTED pointer)
   2  GET the PRM at that pointer over HTTPS (NO redirects). ABORT unless the
-     PRM `resource` covers the URL we asked for.                 (RFC 9728 3, 3.3)
+     PRM `resource` covers the URL we asked for.        (RFC 9728 3; AuthVO 3.3.1)
   3  RESOURCE CHECK (ABORT before any login on failure). For an issuer named in
      the PRM, GET its RFC 8414 metadata (NO redirects) and require
         (a) metadata `issuer` == the issuer the PRM named        (RFC 8414 3.3)
-        (b) `protected_resources` present AND covering our URL   (RFC 9728 4)
+        (b) `protected_resources` present AND covering our URL   (RFC 9728 4; AuthVO 3.3.1)
      The first listed issuer that passes both is the one we use.
   4  Client registration: preconfigured client_id, else RFC 7591 DCR.
   5  Token: device authorization (RFC 8628) -> the user logs in and approves
@@ -66,16 +67,31 @@ the dynamic deep URL the client started from. (So a DataLink deep link like
 .../download/obs123/file456 yields a token for the whole service, e.g.
 https://src.example.org, which is what the resource server expects.)
 
+WHERE THIS PROFILE DEPARTS FROM THE RFCs (deliberately; see README section 15)
+-------------------------------------------------------------------------------
+  * RFC 9728 3.3 asks for the PRM `resource` to be IDENTICAL to the identifier
+    the metadata URL was built from (or to the URL requested). The AuthVO draft
+    (3.3.1) relaxes this to COVERAGE (see is_covered) so that one identifier can
+    govern a service whose endpoints have variable paths. A client that follows
+    RFC 9728 to the letter would reject such a PRM for a deep URL.
+  * RFC 9728 4 makes `protected_resources` OPTIONAL and says nothing about how a
+    client uses it. The AuthVO draft makes it MANDATORY: absent = failure.
+  * No redirect is ever followed (the RFCs are silent; this is stricter).
+  * The resource server checks `aud` only WHEN PRESENT; RFC 9068 4 would require
+    it. INDIGO IAM 1.10 issues tokens without `aud` (observed).
+
 RELEVANT STANDARDS
 ------------------
   RFC 6750  Bearer Token usage + the WWW-Authenticate challenge
   RFC 8414  Authorization Server Metadata (the /.well-known document)
-  RFC 9728  Protected Resource Metadata (sections 3, 3.3, 4, 5)
+  RFC 9728  Protected Resource Metadata (sections 3, 3.1, 3.3, 4, 5)
   RFC 7591  Dynamic Client Registration
   RFC 8628  Device Authorization Grant
   RFC 8707  Resource Indicators (the `resource` parameter)
   RFC 8693  OAuth 2.0 Token Exchange (optional narrowing of the audience)
-  RFC 9207  Authorization Server Issuer Identification (the `iss` check)
+  RFC 9207  NOT applicable: it covers the `iss` parameter of authorization RESPONSES
+            (redirect flows), which the device grant does not have. The `iss` check
+            below is a sanity check on the token's own claim (RFC 7519, 4.1.1).
 
 Dependency:  requests   ->   pip install requests
 Usage:       python authvo_client.py https://src.example.org/datalink/download/obs123/file456
@@ -185,9 +201,10 @@ def is_covered(url: str, resource_id: str) -> bool:
     """Is `url` covered by the resource identifier `resource_id`?
 
     Covered means: the same origin (scheme, host, port), and a path that is equal
-    to the identifier's or extends it AT A PATH-SEGMENT BOUNDARY (RFC 9728 3.3
-    compares a resource with the URL it was found for; AuthVO extends that to
-    deep URLs under one service-level identifier).
+    to the identifier's or extends it AT A PATH-SEGMENT BOUNDARY. This is the
+    AuthVO draft's rule (3.3.1): RFC 9728 3.3 asks for IDENTITY between the PRM's
+    `resource` and the URL, and AuthVO deliberately relaxes that to coverage so
+    that one service-level identifier governs deep URLs.
 
         https://src.example.org            covers every path on that origin
         https://src.example.org/vo         covers /vo and /vo/tap/async/1,
@@ -381,11 +398,11 @@ class AuthVoClient:
         """Fetch the PRM and require that it describes the resource we asked for.
 
         RFC 9728 section 3: the PRM is a JSON document published BY THE RESOURCE
-        SERVER. We fetch it over HTTPS and refuse redirects. Then, per section 3.3,
-        the `resource` it declares must be consistent with the resource we are
-        accessing -- here, it must COVER the URL we asked for (see is_covered). A
-        PRM about some other resource is useless to us and is a sign of spoofing,
-        so we abort.
+        SERVER. We fetch it over HTTPS and refuse redirects. Then the `resource` it
+        declares must COVER the URL we asked for (see is_covered). RFC 9728 3.3
+        itself asks for an exact match; coverage is the AuthVO draft's relaxation
+        (3.3.1, 5.4.2). A PRM about some other resource is useless to us and is a
+        sign of spoofing, so we abort.
         """
         require_https(pointer, "PRM pointer")
         log.info("STEP 2  GET PRM %s  (no redirects)", pointer)
@@ -420,7 +437,8 @@ class AuthVoClient:
         and require, before any user login:
           (a) metadata `issuer` == the issuer the PRM named (RFC 8414 3.3), and
           (b) `protected_resources` is present and one entry covers our URL
-              (RFC 9728 4).
+              (RFC 9728 4 defines the member as optional; AuthVO 3.3.1 makes it
+              mandatory).
         The first issuer that passes both is used; if none does we abort with
         every reason. An ABSENT `protected_resources` is a failure, never a pass.
         """
@@ -620,7 +638,9 @@ class AuthVoClient:
             }, timeout=self.timeout, allow_redirects=False)
             doc = resp.json()
             if resp.status_code == 200:
-                # Got a token. Sanity-check the issuer before using it (step 6).
+                # Got a token. The draft (5.4.5) requires an access token of type
+                # Bearer; then sanity-check the issuer before using it (step 6).
+                self._require_bearer(doc, "access token")
                 self._validate_issuer(doc, meta.issuer, "access token")
                 log.info("        -> access token acquired")
                 self._log_aud(doc, "access token")
@@ -657,6 +677,7 @@ class AuthVoClient:
             "resource": resource_id,             # RFC 8707, belt-and-braces
             "scope": self.exchange_scope,
         })
+        self._require_bearer(doc, "exchanged token")
         self._validate_issuer(doc, meta.issuer, "exchanged token")
         self._log_aud(doc, "exchanged token")
         return doc
@@ -693,8 +714,22 @@ class AuthVoClient:
             log.info("        %s aud=%s (informational; the resource server enforces it)",
                      what, payload.get("aud", "<absent>"))
 
+    @staticmethod
+    def _require_bearer(token_doc: dict, what: str) -> None:
+        """The AuthVO draft (5.4.5) says the client MUST verify that an access token
+        is present and of type Bearer. RFC 6749 7.1: the type is case-insensitive."""
+        token = token_doc.get("access_token")
+        if not isinstance(token, str) or not token:
+            raise SecurityError("%s: the response carries no access_token" % what)
+        ttype = token_doc.get("token_type")
+        if not isinstance(ttype, str) or ttype.lower() != "bearer":
+            raise SecurityError("%s: token_type is %r, expected Bearer" % (what, ttype))
+
     def _validate_issuer(self, token_doc: dict, issuer: str, what: str) -> None:
-        """Client-side `iss` cross-check (RFC 9207 spirit).
+        """Client-side `iss` sanity check (the token's own claim, RFC 7519 4.1.1).
+
+        RFC 9207 (the `iss` parameter of authorization responses) does not apply:
+        the device grant has no authorization response.
 
         If either the token RESPONSE or the JWT itself names an issuer, it MUST
         equal the issuer we discovered and trusted. This catches a token that was

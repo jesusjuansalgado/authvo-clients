@@ -7,13 +7,13 @@ Walks the AuthVO flow (RFC 9728-conformant) against the local stack:
   1. GET the protected resource anonymously (no redirects) -> 401 + a pointer to
      the resource server's own Protected Resource Metadata (PRM). UNTRUSTED.
   2. Fetch the PRM from that pointer. ABORT unless its `resource` COVERS the URL
-     we asked for.                                           (RFC 9728 s3, s3.3)
+     we asked for.                                           (RFC 9728 s3; AuthVO draft 3.3.1)
   3. RESOURCE CHECK -- the security gate. A resource server can claim any issuer,
      so ask the ISSUER: its own RFC 8414 metadata must (a) carry the issuer the
      PRM named and (b) list this resource in `protected_resources`. An absent
      list aborts. This is what stops the "evil service" (a resource that names a
      real issuer to harvest a real token); it happens BEFORE any login.
-                                                            (RFC 8414 s3.3, RFC 9728 s4)
+                                                            (RFC 8414 s3.3; RFC 9728 s4, mandatory in the AuthVO draft)
   4. Client id (registered by provision.sh).
   5. Device Authorization Grant (RFC 8628) -- a human logs in -- then poll the
      token endpoint, sending resource=<the matched id> (RFC 8707) so a
