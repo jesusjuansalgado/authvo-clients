@@ -70,6 +70,75 @@ revised by issue #22) follows [RFC 9728](https://www.rfc-editor.org/rfc/rfc9728)
  7  (refresh would re-send the same `resource` — not implemented in the reference clients)
 ```
 
+The same flow as a sequence diagram (GitHub renders this natively). Everything up to
+and including step 3 happens **before the user is asked to log in**, which is why a failed
+check costs the user nothing:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    actor U as User
+    participant C as Client<br/>(authvo_client.py / AuthVoClient.java)
+    participant RS as Resource server<br/>(e.g. src.local.io)
+    participant AS as Authorization server<br/>(INDIGO IAM, e.g. iam.local.io)
+
+    rect rgba(33, 150, 243, 0.12)
+    Note over C,RS: STEP 1 - probe (no redirects are ever followed)
+    C->>RS: GET /vo-resource (anonymous)
+    RS-->>C: 401 WWW-Authenticate: Bearer resource_metadata="PRM url"
+    Note right of C: the pointer is UNTRUSTED
+    end
+
+    rect rgba(33, 150, 243, 0.12)
+    Note over C,RS: STEP 2 - the resource server's own PRM (RFC 9728)
+    C->>RS: GET /.well-known/oauth-protected-resource (HTTPS)
+    RS-->>C: resource, authorization_servers, scopes_supported
+    alt the PRM resource does not cover the requested URL
+        Note over C: ABORT at step 2
+    end
+    end
+
+    rect rgba(255, 152, 0, 0.16)
+    Note over C,AS: STEP 3 - RESOURCE CHECK, before any login (the security crux)
+    C->>AS: GET /.well-known/oauth-authorization-server (RFC 8414)
+    Note right of AS: the augmenter adds protected_resources<br/>(interim, until INDIGO publishes it)
+    AS-->>C: issuer, protected_resources, endpoints
+    alt (a) issuer differs from the PRM's, or (b) protected_resources is absent or does not cover the URL
+        Note over C: ABORT at step 3 - an evil service is stopped here,<br/>before the user is asked to log in
+    end
+    end
+
+    opt no preconfigured client_id
+        Note over C,AS: STEP 4 - client registration
+        C->>AS: POST registration (RFC 7591)
+        AS-->>C: client_id
+    end
+
+    rect rgba(76, 175, 80, 0.14)
+    Note over C,AS: STEP 5 - device grant and token
+    C->>AS: POST device authorization (RFC 8628)
+    AS-->>C: device_code, user_code, verification URL
+    C->>U: show the resource, the issuer, the URL and the code
+    U->>AS: log in and approve (on the IAM's own page)
+    loop until the user approves
+        C->>AS: POST token (device_code, resource = matched id, RFC 8707)
+        AS-->>C: authorization_pending, then the access token
+    end
+    opt token exchange enabled (off by default)
+        C->>AS: POST token exchange (audience = resource, RFC 8693)
+        AS-->>C: token bound to aud = resource
+    end
+    end
+
+    rect rgba(156, 39, 176, 0.12)
+    Note over C,RS: STEP 6 - access
+    C->>RS: GET /vo-resource with Authorization: Bearer token (no redirects)
+    RS->>AS: fetch the signing keys (JWKS)
+    Note over RS: checks signature, iss, scope vo.read, expiry,<br/>and aud whenever the token carries one
+    RS-->>C: 200 protected data (or 401 / 403)
+    end
+```
+
 **"Covered"** (steps 2 and 3b) means: equal to the identifier, or the same
 scheme, host and port with a path that extends it **at a path-segment
 boundary**. `https://src.local.io/vo` covers `https://src.local.io/vo/tap/async/1`
