@@ -480,6 +480,16 @@ keystore (§7.2), starts the stack, then runs `seed/provision.sh` to create the
 `vo.read` scope, the login users (`admin`/`password`, `vouser`/`vouser`) and the
 `authvo-client` (§7.3). It is safe to re-run.
 
+> **A `docker-compose.override.yml` is merged automatically.** If you keep one in
+> `test-integration/` (say, to remap the proxy to `:8443` so the stack can coexist
+> with another one holding `:443`), `docker compose` picks it up without being
+> asked — but the scripts, the demos and the scenario runner all use
+> `https://iam.local.io/` on `:443`. Skip the override with
+> `COMPOSE_FILE=docker-compose.yml ./setup.sh` (and for any `docker compose`
+> command), or rename the file while you don't need it. While it waits for the IAM,
+> `provision.sh` prints a **diagnosis** every ~30 s (what each URL answers, which
+> port Traefik is really on, whether the IAM was OOM-killed, …), so a stall says why.
+
 ### The demo drivers
 
 Run any of them from `test-integration/demo/`:
@@ -577,6 +587,8 @@ the client processes only.
 | RS `401 invalid_token`, `PyJWKClientConnectionError` | JWKS fetch can't verify TLS — set `SSL_CERT_FILE` on the resource (§9). |
 | RS `403 insufficient_scope` | Token has no `scope` claim — set `IAM_ACCESS_TOKEN_INCLUDE_SCOPE=true`. |
 | DCR: *Grant type not allowed: ...token-exchange* | Self-registration can't request token-exchange. It is off by default now; leave it off or use a preconfigured client (§7.4). |
+| `./setup.sh` sits at *waiting for IAM* although `docker compose logs iam` says *Started IamLoginService* | The proxy is published on a port other than 443 — typically because a `docker-compose.override.yml` remapping it (e.g. `8443:443`) was merged automatically. `provision.sh` now says so in its diagnosis. Re-run with `COMPOSE_FILE=docker-compose.yml ./setup.sh` (§10). |
+| `curl: (22) … 404` on client registration, or every IAM path (even `/login`) answers a bare `404 page not found` while the discovery document works | Traefik has not registered the IAM's router (a start-up race when the proxy and the IAM are recreated together; the discovery document is a different router, served by the augmenter). `docker compose restart proxy`, then re-run `./setup.sh`. `provision.sh` now waits for `/login` as well and retries registration. |
 | `seed/provision.sh` times out after ~7.5 min with `IAM did not come up`, later demos get `404` instead of `401` | Host port 443 is already taken by something else, so the `proxy` (Traefik) service fails to start (`Bind for 0.0.0.0:443 failed: port is already allocated`) while the rest of the stack comes up fine — nothing is actually fronting `iam.local.io`/`src.local.io`, so discovery never succeeds and unrelated requests land wherever else 443 is bound. Check with `docker ps --format "{{.Names}}\t{{.Ports}}" \| grep 443` / `sudo lsof -iTCP:443 -sTCP:LISTEN`, free the port (or remap the `proxy` service's port and the IAM's `IAM_ISSUER`/`IAM_BASE_URL` via a `docker-compose.override.yml`), then re-run `./setup.sh`. |
 
 ---
