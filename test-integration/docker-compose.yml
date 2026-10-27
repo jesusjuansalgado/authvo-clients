@@ -121,13 +121,18 @@ services:
   resource:
     build: ./fake-rs
     environment:
-      RS_RESOURCE_ID: "https://src.local.io"
+      # The SERVICE identifier: the one entry the IAM lists in `protected_resources`
+      # for this service (augmenter/config/protected_resources.json). The service
+      # owns everything at or below RS_SERVICE_PATH; the PRM for any such URL is
+      # GENERATED PER REQUEST and names exactly the URL that was asked about.
+      RS_RESOURCE_ID: "https://src.local.io/vo"
+      RS_SERVICE_PATH: "/vo"
+      # Identifiers a token's aud may name (at least one must cover the request).
+      # Both entries of the IAM's list, so a domain-wide token is accepted too.
+      RS_AUDIENCE_IDS: "https://src.local.io/vo https://src.local.io/datalink"
       RS_ISSUER: "https://iam.local.io/"
-      # The 401 challenge points at THIS server's own PRM (RFC 9728 3.1): the
-      # resource server, not the IAM, publishes the metadata about itself.
-      RS_PRM_URL: "https://src.local.io/.well-known/oauth-protected-resource"
       RS_REQUIRED_SCOPE: "vo.read"
-      RS_TEST_FAULTS: "1"                   # serve the /faults/... discovery fixtures (negative tests)
+      RS_TEST_FAULTS: "1"                   # serve the /vo/faults/... discovery fixtures (negative tests)
       RS_CA_BUNDLE: "/certs/local-ca.pem"   # trust the harness origin for JWKS
       # PyJWKClient (pinned PyJWT 2.7.0) fetches the JWKS via urllib, which
       # ignores RS_CA_BUNDLE; point urllib's default TLS context at our CA too.
@@ -143,7 +148,10 @@ services:
       - ./fake-rs:/payload:ro
     labels:
       - "traefik.enable=true"
-      - "traefik.http.routers.rs.rule=Host(`src.local.io`)"
+      # Only this service's subtree, and the PRMs of its URLs, are sent here: the
+      # shared-host case, where other services on src.local.io would get their own
+      # router (and their own /.well-known/oauth-protected-resource/<their path>).
+      - "traefik.http.routers.rs.rule=Host(`src.local.io`) && (PathPrefix(`/vo`) || PathPrefix(`/.well-known/oauth-protected-resource/vo`))"
       - "traefik.http.routers.rs.entrypoints=websecure"
       - "traefik.http.routers.rs.tls=true"
       - "traefik.http.services.rs.loadbalancer.server.port=8000"
@@ -159,7 +167,6 @@ services:
     environment:
       RS_RESOURCE_ID: "https://evil.local.io"
       RS_ISSUER: "https://iam.local.io/"    # <- names the real IAM
-      RS_PRM_URL: "https://evil.local.io/.well-known/oauth-protected-resource"
       RS_REQUIRED_SCOPE: "vo.read"
       RS_CA_BUNDLE: "/certs/local-ca.pem"
       SSL_CERT_FILE: "/certs/local-ca.pem"
