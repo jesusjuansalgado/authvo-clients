@@ -32,10 +32,10 @@ AuthVO closes that hole with two independent checks, both implemented below:
      list it is refused BEFORE the user is asked to log in. An issuer that
      publishes no such list is refused too: absence is a failure, not a pass.
 
-Once both hold, the user logs in (device grant) and the token request carries the
-matched resource as an RFC 8707 `resource` indicator, so a cooperating issuer
-can bind the token's audience to it. (Optionally the token can be narrowed
-further by RFC 8693 token exchange -- OFF by default, enable it with
+Once both hold, the user logs in (device grant). The device authorization request
+AND the token request carry the audience as RFC 8707 `resource` indicators, so a
+cooperating issuer can bind the token's audience to it. (Optionally the token can
+be narrowed further by RFC 8693 token exchange -- OFF by default, enable it with
 AuthVoClient(token_exchange=True) or AUTHVO_TOKEN_EXCHANGE=1.)
 
 THE FLOW, STEP BY STEP (numbers match the methods below)
@@ -51,9 +51,10 @@ THE FLOW, STEP BY STEP (numbers match the methods below)
      The first listed issuer that passes both is the one we use.
   4  Client registration: preconfigured client_id, else RFC 7591 DCR.
   5  Token: device authorization (RFC 8628) -> the user logs in and approves
-     (we show the resource AND the issuer) -> poll the token endpoint, sending
-     resource=<matched resource id> (RFC 8707). Optional RFC 8693 exchange
-     (off by default).
+     (we show the requested URL, the audience entries AND the issuer) -> poll the
+     token endpoint. `resource` = the audience entries (RFC 8707 2) goes on the
+     device authorization request AND the token request; repeated if there are
+     several. Optional RFC 8693 exchange (off by default).
   6  Present the token to the resource; the RS validates signature, iss, scope,
      expiry, and aud when present.
   7  (refresh would re-send the same `resource`; not implemented here)
@@ -66,10 +67,16 @@ https://src.example.org/vocab; a root identifier covers its whole origin. The en
 of the issuer's `protected_resources`, with the URLs they cover, form the
 AUTHENTICATION DOMAIN. Step 2 does NOT use coverage: it is an exact match.
 
-The token is requested for the resource id that matched in step 3(b), not for
-the dynamic deep URL the client started from. (So a DataLink deep link like
-.../download/obs123/file456 yields a token for the whole service, e.g.
-https://src.example.org, which is what the resource server expects.)
+The AUDIENCE comes from the issuer's `protected_resources`, NEVER from the PRM
+`resource` (which is the requested URL, perhaps with a query: RFC 8707 says a
+resource indicator should not carry one, and INDIGO IAM rejects such values).
+  * audience="covering" (the default): the ONE entry that covered the URL in step
+    3 -- at least this entry is requested (draft 5.4.5). A DataLink deep link
+    like .../download/obs123/file456 therefore yields a token for the whole
+    service, e.g. https://src.example.org/vo.
+  * audience="domain" (AUTHVO_AUDIENCE=domain): EVERY entry, by repeating the
+    `resource` parameter (RFC 8707 2), for a domain-wide token that can be used
+    anywhere in the authentication domain.
 
 WHERE THIS PROFILE DEPARTS FROM THE RFCs (deliberately; see README section 15)
 -------------------------------------------------------------------------------
@@ -136,6 +143,10 @@ WELL_KNOWN_OIDC = "/.well-known/openid-configuration"
 GRANT_DEVICE_CODE = "urn:ietf:params:oauth:grant-type:device_code"
 GRANT_TOKEN_EXCHANGE = "urn:ietf:params:oauth:grant-type:token-exchange"
 TOKEN_TYPE_ACCESS = "urn:ietf:params:oauth:token-type:access_token"
+
+# Which `protected_resources` entries the token is requested for (step 5).
+AUDIENCE_COVERING = "covering"      # only the entry that covered the requested URL
+AUDIENCE_DOMAIN = "domain"          # every entry: a domain-wide token
 
 
 class SecurityError(Exception):
@@ -293,6 +304,17 @@ def urls_match_exactly(requested_url: str, prm_resource: str) -> bool:
     return requested == resource
 
 
+def is_valid_indicator(identifier: str) -> bool:
+    """May `identifier` be sent as an RFC 8707 `resource` value?
+
+    RFC 8707 2: it MUST be an absolute URI and MUST NOT include a fragment. The
+    entries come from the issuer's list, which we do not control, so each is
+    checked before it goes on the wire.
+    """
+    p = urlsplit(identifier)
+    return bool(p.scheme and p.netloc) and "#" not in identifier
+
+
 def require_https(url: str, what: str) -> None:
     """Refuse to talk to a non-HTTPS endpoint for any security-relevant URL.
 
@@ -353,6 +375,8 @@ class ResourceCheck:
     """What a passed resource check (step 3) hands to the rest of the flow."""
     meta: ASMetadata       # the trusted issuer's endpoints
     resource_id: str       # the protected_resources entry that covered our URL
+    # every usable entry of the list (the covering one first), for audience="domain"
+    domain_ids: list[str] = field(default_factory=list)
 
 
 # --------------------------------------------------------------------------- #
@@ -371,7 +395,8 @@ class AuthVoClient:
                  exchange_scope: str = "vo.read",
                  timeout: int = 30,
                  open_browser: bool = False,
-                 token_exchange: bool = False) -> None:
+                 token_exchange: bool = False,
+                 audience: str = AUDIENCE_COVERING) -> None:
         # `scope`          : requested at the device grant (step 5).
         # `client_id`      : if given, we skip dynamic registration (step 4).
         # `exchange_scope` : scope asked for on an exchanged token (step 5d).
@@ -379,6 +404,12 @@ class AuthVoClient:
         # `token_exchange` : also run the RFC 8693 narrowing exchange (step 5d).
         #                    OFF by default: the `resource` indicator on the token
         #                    request (RFC 8707) is the primary audience mechanism.
+        # `audience`       : "covering" (default) requests the ONE protected_resources
+        #                    entry that covered the URL; "domain" requests every entry.
+        if audience not in (AUDIENCE_COVERING, AUDIENCE_DOMAIN):
+            raise ValueError("audience must be %r or %r, not %r"
+                             % (AUDIENCE_COVERING, AUDIENCE_DOMAIN, audience))
+        self.audience = audience
         self.scope = scope
         self.client_id = client_id
         self.exchange_scope = exchange_scope
@@ -404,17 +435,30 @@ class AuthVoClient:
 
         pointer = self._step1_probe(resource_url)                         # 1
         prm = self._step2_prm(resource_url, pointer)                      # 2
-        # Step 3 returns the trusted issuer's metadata plus the resource id our
-        # URL matched; that id (not the deep URL) is what the token is for.
+        # Step 3 returns the trusted issuer's metadata plus the protected_resources
+        # entries the token will be for. They come from the ISSUER's list -- never
+        # from the PRM `resource` (the requested URL, perhaps with a query).
         check = self._step3_resource_check(resource_url, prm)             # 3
-        meta, resource_id = check.meta, check.resource_id
+        meta = check.meta
+        audience_ids = self._audience_ids(check)
         client_id = self._step4_register(meta)                            # 4
-        device = self._step5a_device_authorization(meta, client_id)       # 5
-        self._step5b_prompt_user(device, resource_url, meta.issuer, resource_id)
-        token = self._step5c_poll_token(meta, client_id, device, resource_id)
+        device = self._step5a_device_authorization(meta, client_id, audience_ids)   # 5
+        self._step5b_prompt_user(device, resource_url, meta.issuer, audience_ids)
+        token = self._step5c_poll_token(meta, client_id, device, audience_ids)
         if self.token_exchange:
-            token = self._step5d_token_exchange(meta, client_id, token, resource_id)
+            token = self._step5d_token_exchange(meta, client_id, token, audience_ids)
         return self._step6_access(resource_url, token)                    # 6
+
+    def _audience_ids(self, check: ResourceCheck) -> list[str]:
+        """The `protected_resources` entries the token is requested for (step 5).
+
+        "covering": just the entry that covered the requested URL in step 3 (the
+        draft's SHOULD-at-least). "domain": every usable entry, the covering one
+        first, for a domain-wide token (RFC 8707 2 allows repeating `resource`).
+        """
+        if self.audience == AUDIENCE_DOMAIN:
+            return list(check.domain_ids) or [check.resource_id]
+        return [check.resource_id]
 
     # -- step 1 ------------------------------------------------------------- #
 
@@ -551,8 +595,23 @@ class AuthVoClient:
                                 % (resource_url, listed))
         log.info("        check (b) OK: %s is covered by listed resource %s",
                  resource_url, matched)
+        # The covering entry becomes a `resource` value, so it must be a valid
+        # indicator (RFC 8707 2: an absolute URI without a fragment).
+        if not is_valid_indicator(matched):
+            raise SecurityError("check (b): the covering entry %r is not a valid RFC 8707 "
+                                "resource indicator (absolute URI, no fragment)" % matched)
+        # For audience="domain": every OTHER usable entry, after the covering one.
+        domain_ids = [matched]
+        for entry in listed:
+            if entry in domain_ids:
+                continue
+            if is_valid_indicator(entry):
+                domain_ids.append(entry)
+            else:
+                log.info("        (skipping %r: not a valid RFC 8707 resource indicator)", entry)
 
-        return ResourceCheck(meta=self._endpoints(doc, issuer, oidc_url), resource_id=matched)
+        return ResourceCheck(meta=self._endpoints(doc, issuer, oidc_url),
+                             resource_id=matched, domain_ids=domain_ids)
 
     def _endpoints(self, doc: dict, issuer: str, oidc_url: str) -> ASMetadata:
         """Read the endpoints we need from the (already vetted) RFC 8414 document.
@@ -633,38 +692,58 @@ class AuthVoClient:
 
     # -- step 5 ------------------------------------------------------------- #
 
-    def _step5a_device_authorization(self, meta: ASMetadata, client_id: str) -> dict:
+    @staticmethod
+    def _resource_params(audience_ids: list[str]) -> list[tuple[str, str]]:
+        """The RFC 8707 `resource` parameter, REPEATED once per audience entry.
+
+        RFC 8707 2: "multiple resource parameters may be used". `requests` encodes a
+        list of tuples as repeated form fields, which a dict could not express.
+        """
+        return [("resource", a) for a in audience_ids]
+
+    def _step5a_device_authorization(self, meta: ASMetadata, client_id: str,
+                                     audience_ids: list[str]) -> dict:
         """Start the Device Authorization Grant (RFC 8628).
 
-        We send our client_id and the scopes we want; the IAM returns a
-        device_code (which we poll with) plus a user_code and verification URL
-        (which the human uses). This grant suits CLIs/headless clients because
-        the user authenticates in a normal browser, not in our process.
+        We send our client_id, the scopes we want and the audience as RFC 8707
+        `resource` indicators; the IAM returns a device_code (which we poll with)
+        plus a user_code and verification URL (which the human uses). This grant
+        suits CLIs/headless clients because the user authenticates in a normal
+        browser, not in our process.
+
+        Why `resource` here as well as on the token request (5c): the device grant
+        has no authorization request at the authorization endpoint (RFC 8707 2.1),
+        so the device authorization request is where the resource is first stated;
+        RFC 8707 2.2 then allows it on the token request too. We never send the PRM
+        `resource` -- only entries of the issuer's `protected_resources`.
         """
-        log.info("STEP 5  POST device_authorization (RFC 8628)")
-        doc = self._post_form(meta.device_authorization_endpoint, {
-            "client_id": client_id,
-            "scope": self.scope,
-        })
+        log.info("STEP 5  POST device_authorization (RFC 8628)  resource=%s", audience_ids)
+        doc = self._post_form(meta.device_authorization_endpoint, [
+            ("client_id", client_id),
+            ("scope", self.scope),
+        ] + self._resource_params(audience_ids))
         if "device_code" not in doc:
             raise SecurityError("device authorization response missing device_code")
         return doc
 
     def _step5b_prompt_user(self, device: dict, resource_url: str, issuer: str,
-                            resource_id: str) -> None:
+                            audience_ids: list[str]) -> None:
         """Tell the human where to go and what they are authorizing.
 
-        We show the resource, the resource id the token will be for, AND the
+        We show the requested URL, EVERY entry the token will be for, AND the
         identity provider, so the user can sanity-check that they are logging in
-        to the expected IAM for the expected service. The client never sees the
-        user's credentials -- they are typed into the IAM's own page.
+        to the expected IAM for the expected service(s) -- a domain-wide token
+        (audience="domain") is for several, and the user must see them all. The
+        client never sees the user's credentials -- they are typed into the IAM's
+        own page.
         """
         # verification_uri_complete embeds the user_code; prefer it when present.
         uri = device.get("verification_uri_complete") or device["verification_uri"]
         log.info("        user action required")
         print("\n" + "=" * 64)
         print("  Authorize access to : %s" % resource_url)
-        print("  Token is for        : %s" % resource_id)
+        for i, entry in enumerate(audience_ids):
+            print("  %-19s : %s" % ("Token is for" if i == 0 else "", entry))
         print("  Identity provider   : %s" % issuer)
         print("  Open                : %s" % uri)
         # Only print the code separately if it is not already baked into the URL.
@@ -681,27 +760,28 @@ class AuthVoClient:
                 pass  # headless box / no browser -- the printed URL still works
 
     def _step5c_poll_token(self, meta: ASMetadata, client_id: str,
-                           device: dict, resource_id: str) -> dict:
+                           device: dict, audience_ids: list[str]) -> dict:
         """Poll the token endpoint until the user approves (or we time out).
 
         Per RFC 8628 we poll at `interval` seconds and handle two non-error
         signals: `authorization_pending` (keep waiting) and `slow_down` (back off
-        by 5s). Every poll carries the RFC 8707 `resource` indicator -- the id
-        that matched in step 3(b) -- so a cooperating issuer can bind the token's
-        audience to exactly that resource. If the token is a JWT we log its `aud`
-        for information only: the resource server, not we, enforces it.
+        by 5s). Every poll carries the RFC 8707 `resource` indicator(s) -- the
+        `protected_resources` entries chosen in step 3, repeated if there are
+        several -- so a cooperating issuer can bind the token's audience to
+        exactly those. If the token is a JWT we log its `aud` for information
+        only: the resource server, not we, enforces it.
         """
         interval = int(device.get("interval", 5))
         deadline = time.time() + int(device.get("expires_in", 300))
-        log.info("        polling token endpoint (resource=%s)", resource_id)
+        log.info("        polling token endpoint (resource=%s)", audience_ids)
         while time.time() < deadline:
             time.sleep(interval)  # RFC 8628: wait BEFORE each poll
-            resp = self.http.post(meta.token_endpoint, data={
-                "grant_type": GRANT_DEVICE_CODE,
-                "device_code": device["device_code"],
-                "client_id": client_id,
-                "resource": resource_id,          # RFC 8707 resource indicator
-            }, timeout=self.timeout, allow_redirects=False)
+            resp = self.http.post(meta.token_endpoint, data=[
+                ("grant_type", GRANT_DEVICE_CODE),
+                ("device_code", device["device_code"]),
+                ("client_id", client_id),
+            ] + self._resource_params(audience_ids),   # RFC 8707 resource indicator(s)
+                timeout=self.timeout, allow_redirects=False)
             doc = resp.json()
             if resp.status_code == 200:
                 # Got a token. The draft (5.4.5) requires an access token of type
@@ -723,26 +803,26 @@ class AuthVoClient:
         raise SecurityError("device authorization timed out")
 
     def _step5d_token_exchange(self, meta: ASMetadata, client_id: str,
-                               token: dict, resource_id: str) -> dict:
-        """Optional: exchange the token for one narrowed to exactly this resource.
+                               token: dict, audience_ids: list[str]) -> dict:
+        """Optional: exchange the token for one narrowed to exactly the audience.
 
         RFC 8693 token exchange: we hand in the access token from step 5c and ask
-        for a new token whose `audience` is the target resource id. The result is
-        an `aud`-bound token that cannot be replayed against any other service.
+        for a new token whose `audience` is the same list of `protected_resources`
+        entries used everywhere else (repeated if there are several). The result
+        is an `aud`-bound token that cannot be replayed against any other service.
         Off by default (the `resource` indicator on the token request is the
         primary mechanism); it needs a client the IAM allows to use this grant.
         We send both `audience` (RFC 8693) and `resource` (RFC 8707).
         """
-        log.info("STEP 5d token exchange (RFC 8693)  audience=%s", resource_id)
-        doc = self._post_form(meta.token_endpoint, {
-            "grant_type": GRANT_TOKEN_EXCHANGE,
-            "client_id": client_id,
-            "subject_token": token["access_token"],
-            "subject_token_type": TOKEN_TYPE_ACCESS,
-            "audience": resource_id,             # narrow to the target service
-            "resource": resource_id,             # RFC 8707, belt-and-braces
-            "scope": self.exchange_scope,
-        })
+        log.info("STEP 5d token exchange (RFC 8693)  audience=%s", audience_ids)
+        doc = self._post_form(meta.token_endpoint, [
+            ("grant_type", GRANT_TOKEN_EXCHANGE),
+            ("client_id", client_id),
+            ("subject_token", token["access_token"]),
+            ("subject_token_type", TOKEN_TYPE_ACCESS),
+        ] + [("audience", a) for a in audience_ids]      # narrow to the audience
+          + self._resource_params(audience_ids)          # RFC 8707, belt-and-braces
+          + [("scope", self.exchange_scope)])
         self._require_bearer(doc, "exchanged token")
         self._validate_issuer(doc, meta.issuer, "exchanged token")
         self._log_aud(doc, "exchanged token")
@@ -842,10 +922,12 @@ class AuthVoClient:
             raise SecurityError("POST %s -> %d: %s" % (url, r.status_code, r.text[:300]))
         return r.json()
 
-    def _post_form(self, url: str, form: dict) -> dict:
+    def _post_form(self, url: str, form) -> dict:
         """POST a form-encoded body (used for the OAuth token/device endpoints).
 
-        OAuth endpoints expect application/x-www-form-urlencoded. We surface a
+        `form` is a list of (name, value) pairs -- or a dict -- so a parameter can
+        REPEAT (RFC 8707 `resource`). OAuth endpoints expect
+        application/x-www-form-urlencoded. We surface a
         3xx/4xx/5xx as a SecurityError with a trimmed body so failures are legible.
         """
         r = self.http.post(url, data=form, timeout=self.timeout, allow_redirects=False)
@@ -866,6 +948,9 @@ def main(argv: list[str]) -> int:
       AUTHVO_OPEN_BROWSER    "1" to auto-open the device verification URL
       AUTHVO_TOKEN_EXCHANGE  "1" to ALSO run the RFC 8693 token exchange (off by
                              default; needs a client the IAM lets use that grant)
+      AUTHVO_AUDIENCE        "covering" (default): request the ONE protected_resources
+                             entry that covered the URL; "domain": request EVERY entry
+                             (repeated `resource` parameters) for a domain-wide token
     """
     # Log as plain lines so the STEP trace reads as a clean narrative.
     logging.basicConfig(level=logging.INFO, format="%(message)s")
@@ -875,11 +960,16 @@ def main(argv: list[str]) -> int:
         print("error: pass the protected-resource URL as the first argument",
               file=sys.stderr)
         return 2
-    client = AuthVoClient(
-        client_id=os.environ.get("AUTHVO_CLIENT_ID"),
-        open_browser=os.environ.get("AUTHVO_OPEN_BROWSER") == "1",
-        token_exchange=os.environ.get("AUTHVO_TOKEN_EXCHANGE") == "1",
-    )
+    try:
+        client = AuthVoClient(
+            client_id=os.environ.get("AUTHVO_CLIENT_ID"),
+            open_browser=os.environ.get("AUTHVO_OPEN_BROWSER") == "1",
+            token_exchange=os.environ.get("AUTHVO_TOKEN_EXCHANGE") == "1",
+            audience=os.environ.get("AUTHVO_AUDIENCE", AUDIENCE_COVERING),
+        )
+    except ValueError as e:            # e.g. AUTHVO_AUDIENCE=everything
+        print("error: %s" % e, file=sys.stderr)
+        return 2
     try:
         resp = client.access(resource)
     except SecurityError as e:

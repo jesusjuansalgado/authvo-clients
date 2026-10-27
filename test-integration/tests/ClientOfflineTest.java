@@ -66,21 +66,45 @@ public class ClientOfflineTest {
         return new Canned(401, "token not found", Map.of("WWW-Authenticate", "Bearer resource_metadata=\"" + pointer + "\""));
     }
 
-    /** GETs come from a table; any POST fails the test (the client must have aborted first). */
+    /**
+     * GETs come from a table. A POST fails the test (the client must have aborted first)
+     * unless the test queued answers with {@link #answerPosts}: then each POST takes the next
+     * one and its URL and form body are recorded.
+     */
     static class FakeHttp extends HttpClient {
         final Map<String, Canned> routes;
-        final List<String> gets = new ArrayList<>(), posts = new ArrayList<>();
+        final List<String> gets = new ArrayList<>(), posts = new ArrayList<>(), postBodies = new ArrayList<>();
+        final java.util.ArrayDeque<Canned> postAnswers = new java.util.ArrayDeque<>();
         FakeHttp(Map<String, Canned> routes) { this.routes = routes; }
+
+        FakeHttp answerPosts(Canned... answers) { postAnswers.addAll(List.of(answers)); return this; }
+
+        /** The body a request would send, read back from its publisher. */
+        static String bodyOf(HttpRequest req) {
+            StringBuilder sb = new StringBuilder();
+            req.bodyPublisher().ifPresent(p -> p.subscribe(new java.util.concurrent.Flow.Subscriber<java.nio.ByteBuffer>() {
+                public void onSubscribe(java.util.concurrent.Flow.Subscription s) { s.request(Long.MAX_VALUE); }
+                public void onNext(java.nio.ByteBuffer b) { sb.append(java.nio.charset.StandardCharsets.UTF_8.decode(b)); }
+                public void onError(Throwable t) { throw new AssertionError(t); }
+                public void onComplete() { }
+            }));
+            return sb.toString();
+        }
 
         @Override @SuppressWarnings("unchecked")
         public <T> HttpResponse<T> send(HttpRequest req, HttpResponse.BodyHandler<T> h) throws IOException {
             String url = req.uri().toString();
+            Canned c;
             if (!req.method().equals("GET")) {
                 posts.add(url);
-                throw new AssertionError("POST " + url + ": the client must abort before this point");
+                if (postAnswers.isEmpty())
+                    throw new AssertionError("POST " + url + ": the client must abort before this point");
+                postBodies.add(bodyOf(req));
+                c = postAnswers.poll();
+            } else {
+                gets.add(url);
+                c = routes.getOrDefault(url, status(404));
             }
-            gets.add(url);
-            Canned c = routes.getOrDefault(url, status(404));
             Map<String, List<String>> hs = new HashMap<>();
             c.headers().forEach((k, v) -> hs.put(k, List.of(v)));
             HttpHeaders headers = HttpHeaders.of(hs, (a, b) -> true);
@@ -172,6 +196,34 @@ public class ClientOfflineTest {
             throw new AssertionError("unexpected " + e);
         }
         throw new AssertionError("expected an abort matching /" + regex + "/ but discovery succeeded");
+    }
+
+
+    static AuthVoClient audienceClient(String mode, HttpClient http) {
+        return new AuthVoClient("openid vo.read", "vo.read", "authvo-client", false, mode,
+                http != null ? http : new FakeHttp(Map.of()));
+    }
+
+    /** The audience mode a client built from `env` ends up with (probed through audienceIds). */
+    static String audienceOf(Map<String, String> env) throws Exception {
+        AuthVoClient c = AuthVoClient.fromEnvironment(env::get);
+        AuthVoClient.ResourceCheck chk = new AuthVoClient.ResourceCheck(null, SERVICE, List.of(SERVICE, DATALINK));
+        return c.audienceIds(chk).size() == 2 ? AuthVoClient.AUDIENCE_DOMAIN : AuthVoClient.AUDIENCE_COVERING;
+    }
+
+    /** What step 5b prints for `audience`, captured. */
+    static String prompt(List<String> audience) throws Exception {
+        java.io.PrintStream real = System.out;
+        java.io.ByteArrayOutputStream buf = new java.io.ByteArrayOutputStream();
+        System.setOut(new java.io.PrintStream(buf, true, java.nio.charset.StandardCharsets.UTF_8));
+        try {
+            audienceClient(AuthVoClient.AUDIENCE_COVERING, null).step5bPromptUser(
+                    M.readTree("{\"verification_uri\":\"https://iam.local.io/device\",\"user_code\":\"WDJB\"}"),
+                    RES_URL + "?ID=1", ISSUER, audience);
+        } finally {
+            System.setOut(real);
+        }
+        return buf.toString(java.nio.charset.StandardCharsets.UTF_8);
     }
 
     // ---- the tests ---------------------------------------------------------------
@@ -371,6 +423,121 @@ public class ClientOfflineTest {
                 }
                 throw new AssertionError("expected a SecurityException");
             });
+
+
+        System.out.println("RFC 8707 resource indicators");
+        for (JsonNode v : vectors.get("indicator"))
+            test("indicator " + v.get(0).asText() + " -> " + v.get(1).asBoolean() + " (" + v.get(2).asText() + ")",
+                    () -> eq(v.get(1).asBoolean(), AuthVoClient.isValidIndicator(v.get(0).asText())));
+        test("an unknown audience mode is refused", () -> {
+            try {
+                new AuthVoClient("openid vo.read", "vo.read", "c", false, "everything");
+                throw new AssertionError("expected IllegalArgumentException");
+            } catch (IllegalArgumentException e) {
+                if (!e.getMessage().contains("audience must be")) throw new AssertionError(e.getMessage());
+            }
+        });
+
+        System.out.println("audience option (from protected_resources, never from the PRM resource)");
+        test("covering is the default: only the entry that covered the URL", () -> {
+            AuthVoClient.ResourceCheck c = discover(good(), null);
+            eq(List.of(SERVICE), audienceClient(AuthVoClient.AUDIENCE_COVERING, null).audienceIds(c));
+        });
+        test("domain: every entry, the covering one first", () -> {
+            AuthVoClient.ResourceCheck c = discover(good(AS_URL,
+                    ok(asDoc(ISSUER, "[\"" + DATALINK + "\",\"" + SERVICE + "\"]"))), null);
+            eq(List.of(SERVICE, DATALINK), c.domainIds);
+            eq(List.of(SERVICE, DATALINK), audienceClient(AuthVoClient.AUDIENCE_DOMAIN, null).audienceIds(c));
+            eq(List.of(SERVICE), audienceClient(AuthVoClient.AUDIENCE_COVERING, null).audienceIds(c));
+        });
+        test("domain does not repeat an entry", () -> eq(List.of(SERVICE, DATALINK), discover(good(AS_URL,
+                ok(asDoc(ISSUER, "[\"" + SERVICE + "\",\"" + DATALINK + "\",\"" + SERVICE + "\"]"))), null).domainIds));
+        test("entries that are not valid indicators are skipped", () -> eq(List.of(SERVICE, DATALINK),
+                discover(good(AS_URL, ok(asDoc(ISSUER, "[\"" + SERVICE + "\",\"https://src.local.io/x#frag\","
+                        + "\"not-a-uri\",\"" + DATALINK + "\"]"))), null).domainIds));
+        test("a covering entry that is not a valid indicator aborts", () ->
+                aborts(good(AS_URL, ok(asDoc(ISSUER, "[\"https://src.local.io/vo#frag\"]"))), "not a valid RFC 8707"));
+        test("the audience never comes from the PRM resource (a query is not an audience)", () -> {
+            String q = RES_URL + "?ID=ivo%3A%2F%2Fx%2Fy";
+            String pointer = PRM_URL + "?ID=ivo%3A%2F%2Fx%2Fy";
+            FakeHttp f = new FakeHttp(Map.of(q, challengeTo(pointer), pointer, ok(prm(q)),
+                    AS_URL, ok(asDoc(ISSUER, "[\"" + SERVICE + "\",\"" + DATALINK + "\"]"))));
+            AuthVoClient c = new AuthVoClient("openid vo.read", "vo.read", "authvo-client", false,
+                    AuthVoClient.AUDIENCE_DOMAIN, f);
+            eq(List.of(SERVICE, DATALINK), c.audienceIds(c.discover(q)));
+        });
+
+        System.out.println("resource on BOTH the device authorization request and the token request");
+        String[] aud = {SERVICE, DATALINK};
+        AuthVoClient.AsMetadata meta = new AuthVoClient.AsMetadata(ISSUER, "https://iam.local.io/token",
+                "https://iam.local.io/devicecode", "https://iam.local.io/register");
+        test("the device authorization request carries every resource, repeated", () -> {
+            FakeHttp f = new FakeHttp(Map.of()).answerPosts(ok("{\"device_code\":\"dc\",\"user_code\":\"UC\"}"));
+            new AuthVoClient("openid vo.read", "vo.read", "cid", false, f)
+                    .step5aDeviceAuthorization(meta, "cid", List.of(aud));
+            eq(List.of("https://iam.local.io/devicecode"), f.posts);
+            eq("client_id=cid&scope=openid+vo.read&resource=https%3A%2F%2Fsrc.local.io%2Fvo"
+                    + "&resource=https%3A%2F%2Fsrc.local.io%2Fdatalink", f.postBodies.get(0));
+        });
+        test("every token poll carries the resources too", () -> {
+            FakeHttp f = new FakeHttp(Map.of()).answerPosts(
+                    new Canned(400, "{\"error\":\"authorization_pending\"}", Map.of()),
+                    ok("{\"access_token\":\"t\",\"token_type\":\"Bearer\"}"));
+            JsonNode device = M.readTree("{\"device_code\":\"dc\",\"interval\":0,\"expires_in\":60}");
+            new AuthVoClient("openid vo.read", "vo.read", "cid", false, f)
+                    .step5cPollToken(meta, "cid", device, List.of(aud));
+            eq(2, f.postBodies.size());
+            for (String body : f.postBodies) {
+                eq(true, body.contains("device_code=dc"));
+                eq(true, body.endsWith("&resource=https%3A%2F%2Fsrc.local.io%2Fvo"
+                        + "&resource=https%3A%2F%2Fsrc.local.io%2Fdatalink"));
+            }
+            eq(List.of("https://iam.local.io/token", "https://iam.local.io/token"), f.posts);
+        });
+        test("the token exchange uses the same audience list", () -> {
+            FakeHttp f = new FakeHttp(Map.of()).answerPosts(ok("{\"access_token\":\"t2\",\"token_type\":\"Bearer\"}"));
+            new AuthVoClient("openid vo.read", "vo.read", "cid", true, f)
+                    .step5dTokenExchange(meta, "cid", M.readTree("{\"access_token\":\"t1\"}"), List.of(aud));
+            String body = f.postBodies.get(0);
+            eq(true, body.contains("&audience=https%3A%2F%2Fsrc.local.io%2Fvo&audience=https%3A%2F%2Fsrc.local.io%2Fdatalink&"));
+            eq(true, body.contains("&resource=https%3A%2F%2Fsrc.local.io%2Fvo&resource=https%3A%2F%2Fsrc.local.io%2Fdatalink&"));
+        });
+        test("a single entry is sent once", () -> {
+            FakeHttp f = new FakeHttp(Map.of()).answerPosts(ok("{\"device_code\":\"dc\"}"));
+            new AuthVoClient("openid vo.read", "vo.read", "cid", false, f)
+                    .step5aDeviceAuthorization(meta, "cid", List.of(SERVICE));
+            eq(1, f.postBodies.get(0).split("resource=", -1).length - 1);
+        });
+        test("the form encoder repeats a name and escapes values", () ->
+                eq("a=1&a=x+y%26z", AuthVoClient.encode(List.of(new String[] {"a", "1"}, new String[] {"a", "x y&z"}))));
+
+        System.out.println("AUTHVO_AUDIENCE");
+        test("defaults to covering", () -> {
+            eq(AuthVoClient.AUDIENCE_COVERING, audienceOf(Map.of()));
+            eq(List.of(SERVICE), audienceClient(AuthVoClient.AUDIENCE_COVERING, null)
+                    .audienceIds(discover(good(), null)));
+        });
+        test("comes from the environment", () -> eq(AuthVoClient.AUDIENCE_DOMAIN, audienceOf(Map.of("AUTHVO_AUDIENCE", "domain"))));
+        test("a bad value is a usage error", () -> {
+            try {
+                audienceOf(Map.of("AUTHVO_AUDIENCE", "everything"));
+                throw new AssertionError("expected IllegalArgumentException");
+            } catch (IllegalArgumentException e) {
+                if (!e.getMessage().contains("audience must be")) throw new AssertionError(e.getMessage());
+            }
+        });
+
+        System.out.println("step 5b - the prompt shows what the token is for");
+        test("one entry", () -> {
+            String out = prompt(List.of(SERVICE));
+            eq(true, out.contains(RES_URL + "?ID=1") && out.contains(ISSUER) && out.contains(SERVICE));
+            eq(false, out.contains(DATALINK));
+        });
+        test("every entry of a domain-wide token, under one label", () -> {
+            String out = prompt(List.of(SERVICE, DATALINK));
+            eq(true, out.contains(SERVICE) && out.contains(DATALINK));
+            eq(1, out.split("Token is for", -1).length - 1);
+        });
 
         System.out.println("\n" + (ran - failures) + "/" + ran + " passed");
         System.exit(failures == 0 ? 0 : 1);

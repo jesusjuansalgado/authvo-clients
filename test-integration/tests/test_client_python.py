@@ -12,11 +12,18 @@ What is covered:
     they must ABORT. Each abort test also asserts that nothing was POSTed, i.e.
     that the client stopped before requesting a device code / asking for a login.
 """
+import contextlib
 import importlib.util
+import io
 import json
+import os
 import sys
 import unittest
+from unittest import mock
+
 from pathlib import Path
+
+import requests
 
 HERE = Path(__file__).resolve().parent
 _spec = importlib.util.spec_from_file_location(
@@ -356,6 +363,194 @@ class BearerCheck(unittest.TestCase):
             with self.subTest(doc=doc):
                 with self.assertRaisesRegex(ac.SecurityError, "no access_token"):
                     self.check(doc)
+
+
+class IndicatorVectors(unittest.TestCase):
+    """RFC 8707 2: a resource indicator is an absolute URI without a fragment.
+    The same vectors drive the Java client's tests."""
+
+    def test_vectors(self):
+        vectors = json.loads((Path(__file__).parent / "coverage_vectors.json").read_text())["indicator"]
+        self.assertGreater(len(vectors), 5)
+        for url, expected, why in vectors:
+            with self.subTest(url=url, why=why):
+                self.assertIs(ac.is_valid_indicator(url), expected)
+
+
+class AudienceOption(unittest.TestCase):
+    """The token's audience comes from the issuer's `protected_resources`, never from the
+    PRM `resource`: the covering entry by default, every entry with audience="domain"."""
+
+    def check_for(self, listed, url=RES_URL, **kw):
+        doc = dict(AS_DOC, protected_resources=listed)
+        c = client_with(good_routes(**{AS_URL: FakeResponse(200, doc)}), **kw)
+        prm = ac.ProtectedResourceMetadata(PRM_URL, url, [ISSUER])
+        return c, c._step3_resource_check(url, prm)
+
+    def test_default_is_covering(self):
+        self.assertEqual(ac.AuthVoClient().audience, "covering")
+
+    def test_an_unknown_audience_mode_is_refused(self):
+        with self.assertRaisesRegex(ValueError, "audience must be"):
+            ac.AuthVoClient(audience="everything")
+
+    def test_covering_requests_only_the_entry_that_covered_the_url(self):
+        c, chk = self.check_for([DATALINK, SERVICE])
+        self.assertEqual(c._audience_ids(chk), [SERVICE])
+
+    def test_domain_requests_every_entry_covering_one_first(self):
+        c, chk = self.check_for([DATALINK, SERVICE], audience="domain")
+        self.assertEqual(chk.domain_ids, [SERVICE, DATALINK])
+        self.assertEqual(c._audience_ids(chk), [SERVICE, DATALINK])
+
+    def test_domain_does_not_repeat_an_entry(self):
+        c, chk = self.check_for([SERVICE, DATALINK, SERVICE], audience="domain")
+        self.assertEqual(c._audience_ids(chk), [SERVICE, DATALINK])
+
+    def test_entries_that_are_not_valid_indicators_are_skipped(self):
+        # RFC 8707 2: an absolute URI WITHOUT a fragment
+        c, chk = self.check_for([SERVICE, "https://src.local.io/x#frag", "not-a-uri", DATALINK],
+                                audience="domain")
+        self.assertEqual(c._audience_ids(chk), [SERVICE, DATALINK])
+
+    def test_a_covering_entry_that_is_not_a_valid_indicator_aborts(self):
+        # (an entry with a fragment still COVERS the URL, since coverage ignores fragments)
+        with self.assertRaisesRegex(ac.SecurityError, "not a valid RFC 8707"):
+            self.check_for(["https://src.local.io/vo#frag"])
+
+    def test_the_audience_never_comes_from_the_prm_resource(self):
+        with_query = RES_URL + "?ID=ivo%3A%2F%2Fx%2Fy"
+        c, chk = self.check_for([SERVICE, DATALINK], url=with_query, audience="domain")
+        self.assertNotIn(with_query, c._audience_ids(chk))
+        self.assertEqual(c._audience_ids(chk), [SERVICE, DATALINK])
+
+
+class Recorder:
+    """A session that records every POST and answers from a script."""
+
+    def __init__(self, *responses):
+        self.responses, self.posts, self.headers = list(responses), [], {}
+
+    def post(self, url, data=None, **kw):
+        self.posts.append((url, data, kw))
+        return self.responses.pop(0)
+
+
+META = ac.ASMetadata(issuer=ISSUER, token_endpoint="https://iam.local.io/token",
+                     device_authorization_endpoint="https://iam.local.io/devicecode",
+                     registration_endpoint="https://iam.local.io/register")
+
+
+def resources_of(data):
+    """The values of every `resource` field of a form (a list of (name, value) pairs)."""
+    return [v for k, v in data if k == "resource"]
+
+
+class ResourceOnBothDeviceRequests(unittest.TestCase):
+    """RFC 8707: `resource` goes on the device authorization request AND the token request,
+    repeated once per entry; `requests` needs a list of pairs for that (a dict cannot)."""
+
+    AUD = [SERVICE, DATALINK]
+
+    def test_device_authorization_request_carries_the_resources(self):
+        c = ac.AuthVoClient(client_id="cid")
+        c.http = Recorder(FakeResponse(200, {"device_code": "dc", "user_code": "UC"}))
+        c._step5a_device_authorization(META, "cid", self.AUD)
+        url, data, _ = c.http.posts[0]
+        self.assertEqual(url, META.device_authorization_endpoint)
+        self.assertIsInstance(data, list)
+        self.assertEqual(resources_of(data), self.AUD)
+        self.assertIn(("client_id", "cid"), data)
+
+    def test_every_token_poll_carries_the_resources(self):
+        c = ac.AuthVoClient(client_id="cid")
+        c.http = Recorder(FakeResponse(400, {"error": "authorization_pending"}),
+                          FakeResponse(200, {"access_token": "t", "token_type": "Bearer"}))
+        with mock.patch.object(ac.time, "sleep", lambda s: None):
+            c._step5c_poll_token(META, "cid", {"device_code": "dc", "interval": 1, "expires_in": 60}, self.AUD)
+        self.assertEqual(len(c.http.posts), 2)
+        for url, data, kw in c.http.posts:
+            self.assertEqual(url, META.token_endpoint)
+            self.assertEqual(resources_of(data), self.AUD)
+            self.assertIn(("device_code", "dc"), data)
+            self.assertIs(kw["allow_redirects"], False)
+
+    def test_the_token_exchange_uses_the_same_audience_list(self):
+        c = ac.AuthVoClient(client_id="cid", token_exchange=True)
+        c.http = Recorder(FakeResponse(200, {"access_token": "t2", "token_type": "Bearer"}))
+        c._step5d_token_exchange(META, "cid", {"access_token": "t1"}, self.AUD)
+        data = c.http.posts[0][1]
+        self.assertEqual([v for k, v in data if k == "audience"], self.AUD)
+        self.assertEqual(resources_of(data), self.AUD)
+
+    def test_a_single_entry_is_sent_once(self):
+        c = ac.AuthVoClient(client_id="cid")
+        c.http = Recorder(FakeResponse(200, {"device_code": "dc"}))
+        c._step5a_device_authorization(META, "cid", [SERVICE])
+        self.assertEqual(resources_of(c.http.posts[0][1]), [SERVICE])
+
+    def test_the_wire_encoding_repeats_the_parameter(self):
+        body = requests.models.RequestEncodingMixin._encode_params(
+            ac.AuthVoClient._resource_params(self.AUD))
+        self.assertEqual(body, "resource=https%3A%2F%2Fsrc.local.io%2Fvo&"
+                               "resource=https%3A%2F%2Fsrc.local.io%2Fdatalink")
+
+
+class Prompt(unittest.TestCase):
+    """Step 5b: the user must SEE what the token is for, every entry, and who issues it."""
+
+    def banner(self, audience):
+        c = ac.AuthVoClient()
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out):
+            c._step5b_prompt_user({"verification_uri": "https://iam.local.io/device", "user_code": "WDJB"},
+                                  RES_URL + "?ID=1", ISSUER, audience)
+        return out.getvalue()
+
+    def test_shows_the_requested_url_the_issuer_and_the_one_entry(self):
+        text = self.banner([SERVICE])
+        self.assertIn(RES_URL + "?ID=1", text)
+        self.assertIn(ISSUER, text)
+        self.assertIn(SERVICE, text)
+        self.assertNotIn(DATALINK, text)
+
+    def test_shows_every_entry_of_a_domain_wide_token(self):
+        text = self.banner([SERVICE, DATALINK])
+        self.assertIn(SERVICE, text)
+        self.assertIn(DATALINK, text)
+        self.assertEqual(text.count("Token is for"), 1)           # one label, several lines
+
+
+class Cli(unittest.TestCase):
+    def run_main(self, env):
+        seen = {}
+
+        class FakeClient:
+            def __init__(self, **kw):
+                seen.update(kw)
+
+            def access(self, url):
+                raise ac.SecurityError("stop here")
+
+        with mock.patch.dict(os.environ, env, clear=False), \
+                mock.patch.object(ac, "AuthVoClient", FakeClient):
+            if "AUTHVO_AUDIENCE" not in env:          # ignore the caller's own environment
+                os.environ.pop("AUTHVO_AUDIENCE", None)
+            rc = ac.main(["authvo_client.py", RES_URL])
+        return rc, seen
+
+    def test_audience_defaults_to_covering(self):
+        self.assertEqual(self.run_main({})[1]["audience"], "covering")
+
+    def test_audience_comes_from_the_environment(self):
+        self.assertEqual(self.run_main({"AUTHVO_AUDIENCE": "domain"})[1]["audience"], "domain")
+
+    def test_a_bad_audience_is_a_usage_error_not_a_traceback(self):
+        with mock.patch.dict(os.environ, {"AUTHVO_AUDIENCE": "everything"}), \
+                contextlib.redirect_stderr(io.StringIO()) as err:
+            rc = ac.main(["authvo_client.py", RES_URL])
+        self.assertEqual(rc, 2)
+        self.assertIn("audience must be", err.getvalue())
 
 
 class TokenExchangeOptional(unittest.TestCase):

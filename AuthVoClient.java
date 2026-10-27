@@ -13,7 +13,6 @@ import java.time.Duration;
 import java.time.Instant;
 import java.util.ArrayList;
 import java.util.Base64;
-import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
 import java.util.regex.Matcher;
@@ -44,8 +43,8 @@ import java.util.regex.Pattern;
  *       it mandatory). An issuer that publishes no list is refused: absence
  *       is a failure, not a pass. All of this happens BEFORE any user login.</li>
  * </ol>
- * The token request then carries the matched resource as an RFC 8707
- * {@code resource} indicator so a cooperating issuer can bind the token's
+ * The device authorization request AND the token request then carry the audience as
+ * RFC 8707 {@code resource} indicators so a cooperating issuer can bind the token's
  * audience to it. (RFC 8693 token exchange can narrow it further -- OPTIONAL, off by
  * default; enable it with the constructor flag or AUTHVO_TOKEN_EXCHANGE=1.)
  *
@@ -61,9 +60,11 @@ import java.util.regex.Pattern;
  *        (b) protected_resources present AND covering our URL     (RFC 9728 4; AuthVO 3.3.1)
  *      The first listed issuer that passes both is used.
  *   4  Client registration: preconfigured client_id, else RFC 7591 DCR.
- *   5  Token: device authorization (RFC 8628) -> user logs in (we show the
- *      resource AND the issuer) -> poll the token endpoint with
- *      resource=&lt;matched resource id&gt; (RFC 8707). Optional RFC 8693 exchange.
+ *   5  Token: device authorization (RFC 8628) -> user logs in (we show the requested
+ *      URL, the audience entries AND the issuer) -> poll the token endpoint.
+ *      resource=&lt;audience entry&gt; (RFC 8707 2) goes on the device authorization
+ *      request AND the token request, repeated if there are several.
+ *      Optional RFC 8693 exchange.
  *   6  Present the token; the RS validates signature, iss, scope, expiry and aud
  *      when present.
  *   7  (refresh would re-send the same resource; not implemented here)
@@ -75,6 +76,18 @@ import java.util.regex.Pattern;
  * covers its whole origin. The entries of the issuer's {@code protected_resources}, with the
  * URLs they cover, form the AUTHENTICATION DOMAIN. Step 2 does NOT use coverage: it is an
  * exact match.
+ *
+ * <h2>The audience: from the issuer's list, never from the PRM</h2>
+ * The PRM {@code resource} is the requested URL, perhaps with a query: RFC 8707 says a
+ * resource indicator should not carry one, and INDIGO IAM rejects such values. So the
+ * token is requested for entries of the issuer's {@code protected_resources}:
+ * <ul>
+ *   <li>{@link #AUDIENCE_COVERING} (default): the ONE entry that covered the URL in step 3
+ *       -- at least this entry is requested (draft 5.4.5). A DataLink deep link therefore
+ *       yields a token for the whole service, e.g. {@code https://src.example.org/vo}.</li>
+ *   <li>{@link #AUDIENCE_DOMAIN} (AUTHVO_AUDIENCE=domain): EVERY entry, by repeating the
+ *       {@code resource} parameter (RFC 8707 2), for a domain-wide token.</li>
+ * </ul>
  *
  * <h2>Where this profile departs from the RFCs (deliberately; see README section 15)</h2>
  * <ul>
@@ -105,6 +118,12 @@ public class AuthVoClient {
     private static final String GRANT_DEVICE = "urn:ietf:params:oauth:grant-type:device_code";
     private static final String GRANT_EXCHANGE = "urn:ietf:params:oauth:grant-type:token-exchange";
     private static final String TOKEN_TYPE_ACCESS = "urn:ietf:params:oauth:token-type:access_token";
+    /** Audience mode (step 5): request only the {@code protected_resources} entry that covered the URL. */
+    public static final String AUDIENCE_COVERING = "covering";
+    /** Audience mode (step 5): request EVERY {@code protected_resources} entry (a domain-wide token). */
+    public static final String AUDIENCE_DOMAIN = "domain";
+    // RFC 8707 2: a resource indicator is an absolute URI ("scheme://authority...") without a fragment
+    private static final Pattern ABSOLUTE_URI = Pattern.compile("^[A-Za-z][A-Za-z0-9+.\\-]*://[^/?#]+");
     // Pulls the PRM pointer out of:  Bearer resource_metadata="https://..."
     private static final Pattern RES_META_QUOTED =
             Pattern.compile("resource_metadata\\s*=\\s*\"([^\"]+)\"");
@@ -120,6 +139,7 @@ public class AuthVoClient {
     private final String scope;          // requested at the device grant (step 5)
     private final String exchangeScope;  // requested on an exchanged token (step 5d)
     private final boolean tokenExchange; // also run the RFC 8693 exchange (step 5d); off by default
+    private final String audience;       // AUDIENCE_COVERING (default) or AUDIENCE_DOMAIN (step 5)
     private String clientId;             // may start null and be filled by DCR
     private int lastStatus = -1;         // HTTP status of the final resource call
 
@@ -129,12 +149,34 @@ public class AuthVoClient {
     }
 
     public AuthVoClient(String scope, String exchangeScope, String clientId, boolean tokenExchange) {
-        this(scope, exchangeScope, clientId, tokenExchange, defaultHttpClient());
+        this(scope, exchangeScope, clientId, tokenExchange, AUDIENCE_COVERING, defaultHttpClient());
+    }
+
+    /**
+     * As above, choosing which {@code protected_resources} entries the token is requested for:
+     * {@link #AUDIENCE_COVERING} (the entry that covered the URL) or {@link #AUDIENCE_DOMAIN}
+     * (every entry, by repeating the RFC 8707 {@code resource} parameter).
+     *
+     * @throws IllegalArgumentException if {@code audience} is neither
+     */
+    public AuthVoClient(String scope, String exchangeScope, String clientId, boolean tokenExchange,
+                        String audience) {
+        this(scope, exchangeScope, clientId, tokenExchange, audience, defaultHttpClient());
     }
 
     /** Package-private: lets the offline tests inject a fake HttpClient. */
     AuthVoClient(String scope, String exchangeScope, String clientId, boolean tokenExchange,
                  HttpClient http) {
+        this(scope, exchangeScope, clientId, tokenExchange, AUDIENCE_COVERING, http);
+    }
+
+    /** Package-private: the full constructor (audience mode and an injectable HttpClient). */
+    AuthVoClient(String scope, String exchangeScope, String clientId, boolean tokenExchange,
+                 String audience, HttpClient http) {
+        if (!AUDIENCE_COVERING.equals(audience) && !AUDIENCE_DOMAIN.equals(audience))
+            throw new IllegalArgumentException("audience must be '" + AUDIENCE_COVERING
+                    + "' or '" + AUDIENCE_DOMAIN + "', not '" + audience + "'");
+        this.audience = audience;
         this.scope = scope;
         this.exchangeScope = exchangeScope;
         this.clientId = clientId;
@@ -173,13 +215,27 @@ public class AuthVoClient {
     public String access(String resourceUrl) throws Exception {
         ResourceCheck check = discover(resourceUrl);                              // 1-3
         AsMetadata meta = check.meta;
-        String resourceId = check.resourceId;   // the token is for THIS, not the deep URL
+        // The token is for entries of the ISSUER's protected_resources -- never for the
+        // PRM `resource` (the requested URL, perhaps with a query) and not for the deep URL.
+        List<String> audienceIds = audienceIds(check);
         String cid = step4Register(meta);                                         // 4
-        JsonNode device = step5aDeviceAuthorization(meta, cid);                   // 5
-        step5bPromptUser(device, resourceUrl, meta.issuer, resourceId);
-        JsonNode token = step5cPollToken(meta, cid, device, resourceId);
-        if (tokenExchange) token = step5dTokenExchange(meta, cid, token, resourceId);
+        JsonNode device = step5aDeviceAuthorization(meta, cid, audienceIds);      // 5
+        step5bPromptUser(device, resourceUrl, meta.issuer, audienceIds);
+        JsonNode token = step5cPollToken(meta, cid, device, audienceIds);
+        if (tokenExchange) token = step5dTokenExchange(meta, cid, token, audienceIds);
         return step6Access(resourceUrl, token);                                   // 6
+    }
+
+    /**
+     * The {@code protected_resources} entries the token is requested for (step 5).
+     * {@link #AUDIENCE_COVERING}: just the entry that covered the requested URL in step 3
+     * (the draft's SHOULD-at-least). {@link #AUDIENCE_DOMAIN}: every usable entry, the
+     * covering one first, for a domain-wide token (RFC 8707 2 allows repeating
+     * {@code resource}).
+     */
+    List<String> audienceIds(ResourceCheck check) {
+        if (AUDIENCE_DOMAIN.equals(audience)) return check.domainIds;
+        return List.of(check.resourceId);
     }
 
     /** HTTP status of the resource's final answer (-1 if the flow never got there). */
@@ -281,7 +337,8 @@ public class AuthVoClient {
             try {
                 ResourceCheck check = checkIssuer(resourceUrl, issuer);
                 log("        issuer %s ACCEPTED", issuer);
-                log("        -> token will be requested for resource id: %s", check.resourceId);
+                log("        -> token will be requested for: %s",
+                        AUDIENCE_DOMAIN.equals(audience) ? check.domainIds : List.of(check.resourceId));
                 return check;
             } catch (SecurityException e) {
                 log("        issuer %s REJECTED: %s", issuer, e.getMessage());
@@ -321,8 +378,20 @@ public class AuthVoClient {
             throw new SecurityException("check (b): " + resourceUrl
                     + " is not covered by the issuer's protected_resources " + listed);
         log("        check (b) OK: %s is covered by listed resource %s", resourceUrl, matched);
+        // The covering entry becomes a `resource` value, so it must be a valid indicator
+        // (RFC 8707 2: an absolute URI without a fragment).
+        if (!isValidIndicator(matched))
+            throw new SecurityException("check (b): the covering entry '" + matched
+                    + "' is not a valid RFC 8707 resource indicator (absolute URI, no fragment)");
+        // For AUDIENCE_DOMAIN: every OTHER usable entry, after the covering one.
+        List<String> domainIds = new ArrayList<>(List.of(matched));
+        for (String entry : listed) {
+            if (domainIds.contains(entry)) continue;
+            if (isValidIndicator(entry)) domainIds.add(entry);
+            else log("        (skipping '%s': not a valid RFC 8707 resource indicator)", entry);
+        }
 
-        return new ResourceCheck(endpoints(doc, issuer, urls[1]), matched);
+        return new ResourceCheck(endpoints(doc, issuer, urls[1]), matched, domainIds);
     }
 
     /**
@@ -407,15 +476,45 @@ public class AuthVoClient {
     }
 
     /**
+     * The RFC 8707 {@code resource} parameter, REPEATED once per audience entry.
+     * RFC 8707 2: "multiple resource parameters may be used". A {@code Map} cannot hold
+     * the same key twice, so forms are lists of {name, value} pairs.
+     */
+    static List<String[]> resourceParams(List<String> audienceIds) {
+        List<String[]> out = new ArrayList<>();
+        for (String a : audienceIds) out.add(new String[] {"resource", a});
+        return out;
+    }
+
+    /**
+     * May {@code identifier} be sent as an RFC 8707 {@code resource} value? RFC 8707 2: it
+     * MUST be an absolute URI and MUST NOT include a fragment. The entries come from the
+     * issuer's list, which we do not control, so each is checked before it goes on the wire.
+     */
+    static boolean isValidIndicator(String identifier) {
+        return identifier != null && ABSOLUTE_URI.matcher(identifier).find()
+                && identifier.indexOf('#') < 0;
+    }
+
+    /**
      * Step 5a: start the Device Authorization Grant (RFC 8628). The response holds a
      * device_code (we poll with) plus a user_code + URL (the human uses). Suits
      * CLIs/headless clients: the user authenticates in a browser, not in-process.
+     *
+     * <p>The audience goes here as RFC 8707 {@code resource} indicators, and again on the
+     * token request (5c): the device grant has no authorization request at the
+     * authorization endpoint (RFC 8707 2.1), so the device authorization request is where
+     * the resource is first stated; RFC 8707 2.2 then allows it on the token request too.
+     * We never send the PRM {@code resource} -- only entries of the issuer's
+     * {@code protected_resources}.
      */
-    private JsonNode step5aDeviceAuthorization(AsMetadata meta, String cid) throws Exception {
-        log("STEP 5  POST device_authorization (RFC 8628)");
-        Map<String, String> form = new LinkedHashMap<>();
-        form.put("client_id", cid);
-        form.put("scope", scope);
+    JsonNode step5aDeviceAuthorization(AsMetadata meta, String cid, List<String> audienceIds)
+            throws Exception {
+        log("STEP 5  POST device_authorization (RFC 8628)  resource=%s", audienceIds);
+        List<String[]> form = new ArrayList<>();
+        form.add(new String[] {"client_id", cid});
+        form.add(new String[] {"scope", scope});
+        form.addAll(resourceParams(audienceIds));
         JsonNode doc = postForm(meta.deviceAuthorizationEndpoint, form);
         if (!doc.hasNonNull("device_code"))
             throw new SecurityException("device authorization response missing device_code");
@@ -424,19 +523,21 @@ public class AuthVoClient {
 
     /**
      * Step 5b: tell the human where to go and what they are authorizing. We show the
-     * resource, the resource id the token is for, AND the identity provider so they can
-     * sanity-check the IAM/service before logging in. The client never sees their
-     * credentials.
+     * requested URL, EVERY entry the token will be for, AND the identity provider so they
+     * can sanity-check the IAM/service(s) before logging in -- a domain-wide token is for
+     * several, and the user must see them all. The client never sees their credentials.
      */
-    private void step5bPromptUser(JsonNode device, String resourceUrl, String issuer,
-                                  String resourceId) {
+    void step5bPromptUser(JsonNode device, String resourceUrl, String issuer,
+                          List<String> audienceIds) {
         // verification_uri_complete embeds the user_code; prefer it when present.
         String uri = device.path("verification_uri_complete")
                 .asText(device.path("verification_uri").asText(""));
         log("        user action required");
         System.out.println("\n" + "=".repeat(64));
         System.out.println("  Authorize access to : " + resourceUrl);
-        System.out.println("  Token is for        : " + resourceId);
+        for (int i = 0; i < audienceIds.size(); i++)
+            System.out.println("  " + (i == 0 ? "Token is for       " : "                   ")
+                    + " : " + audienceIds.get(i));
         System.out.println("  Identity provider   : " + issuer);
         System.out.println("  Open                : " + uri);
         // Only print the code separately if it is not already in the URL.
@@ -449,23 +550,23 @@ public class AuthVoClient {
      * Step 5c: poll the token endpoint until the user approves (or we time out). Per
      * RFC 8628 we wait `interval` seconds between polls and handle two non-error
      * signals: authorization_pending (keep waiting) and slow_down (back off 5s). Every
-     * poll carries the RFC 8707 {@code resource} indicator -- the id that matched in
-     * step 3(b) -- so a cooperating issuer can bind the audience to exactly that
-     * resource. If the token is a JWT we log its aud for information only: the resource
-     * server, not we, enforces it.
+     * poll carries the RFC 8707 {@code resource} indicator(s) -- the
+     * {@code protected_resources} entries chosen in step 3, repeated if there are several
+     * -- so a cooperating issuer can bind the audience to exactly those. If the token is
+     * a JWT we log its aud for information only: the resource server, not we, enforces it.
      */
-    private JsonNode step5cPollToken(AsMetadata meta, String cid, JsonNode device,
-                                     String resourceId) throws Exception {
+    JsonNode step5cPollToken(AsMetadata meta, String cid, JsonNode device,
+                             List<String> audienceIds) throws Exception {
         int interval = device.path("interval").asInt(5);
         Instant deadline = Instant.now().plusSeconds(device.path("expires_in").asInt(300));
-        log("        polling token endpoint (resource=%s)", resourceId);
+        log("        polling token endpoint (resource=%s)", audienceIds);
         while (Instant.now().isBefore(deadline)) {
             Thread.sleep(interval * 1000L);          // RFC 8628: wait before each poll
-            Map<String, String> form = new LinkedHashMap<>();
-            form.put("grant_type", GRANT_DEVICE);
-            form.put("device_code", device.get("device_code").asText());
-            form.put("client_id", cid);
-            form.put("resource", resourceId);          // RFC 8707 resource indicator
+            List<String[]> form = new ArrayList<>();
+            form.add(new String[] {"grant_type", GRANT_DEVICE});
+            form.add(new String[] {"device_code", device.get("device_code").asText()});
+            form.add(new String[] {"client_id", cid});
+            form.addAll(resourceParams(audienceIds));  // RFC 8707 resource indicator(s)
             HttpResponse<String> r = send(HttpRequest.newBuilder(URI.create(meta.tokenEndpoint))
                     .header("Content-Type", "application/x-www-form-urlencoded")
                     .POST(HttpRequest.BodyPublishers.ofString(encode(form))));
@@ -489,22 +590,23 @@ public class AuthVoClient {
 
     /**
      * Step 5d (optional, off by default): RFC 8693 token exchange -- swap the token for
-     * one whose {@code audience} is the target resource, so it cannot be replayed against
-     * any other service. (The {@code resource} indicator in step 5c is the primary
+     * one whose {@code audience} is the same list of {@code protected_resources} entries
+     * used everywhere else (repeated if there are several), so it cannot be replayed
+     * against any other service. (The {@code resource} indicator in step 5c is the primary
      * mechanism); this needs a client the IAM allows to use the exchange grant. We send both `audience`
      * (RFC 8693) and `resource` (RFC 8707).
      */
-    private JsonNode step5dTokenExchange(AsMetadata meta, String cid, JsonNode token,
-                                         String resourceId) throws Exception {
-        log("STEP 5d token exchange (RFC 8693)  audience=%s", resourceId);
-        Map<String, String> form = new LinkedHashMap<>();
-        form.put("grant_type", GRANT_EXCHANGE);
-        form.put("client_id", cid);
-        form.put("subject_token", token.get("access_token").asText());
-        form.put("subject_token_type", TOKEN_TYPE_ACCESS);
-        form.put("audience", resourceId);              // narrow to the target service
-        form.put("resource", resourceId);              // RFC 8707, belt-and-braces
-        form.put("scope", exchangeScope);
+    JsonNode step5dTokenExchange(AsMetadata meta, String cid, JsonNode token,
+                                 List<String> audienceIds) throws Exception {
+        log("STEP 5d token exchange (RFC 8693)  audience=%s", audienceIds);
+        List<String[]> form = new ArrayList<>();
+        form.add(new String[] {"grant_type", GRANT_EXCHANGE});
+        form.add(new String[] {"client_id", cid});
+        form.add(new String[] {"subject_token", token.get("access_token").asText()});
+        form.add(new String[] {"subject_token_type", TOKEN_TYPE_ACCESS});
+        for (String a : audienceIds) form.add(new String[] {"audience", a});  // narrow to the audience
+        form.addAll(resourceParams(audienceIds));                              // RFC 8707, belt-and-braces
+        form.add(new String[] {"scope", exchangeScope});
         JsonNode doc = postForm(meta.tokenEndpoint, form);
         requireBearer(doc, "exchanged token");
         validateIssuer(doc, meta.issuer, "exchanged token");
@@ -791,8 +893,11 @@ public class AuthVoClient {
         return doc;
     }
 
-    /** POST a form-encoded body (the OAuth endpoints expect this), parse JSON. */
-    private JsonNode postForm(String url, Map<String, String> form) throws Exception {
+    /**
+     * POST a form-encoded body (the OAuth endpoints expect this), parse JSON. The form is a
+     * list of {name, value} pairs so a parameter can REPEAT (RFC 8707 {@code resource}).
+     */
+    private JsonNode postForm(String url, List<String[]> form) throws Exception {
         HttpResponse<String> r = send(HttpRequest.newBuilder(URI.create(url))
                 .header("Content-Type", "application/x-www-form-urlencoded")
                 .POST(HttpRequest.BodyPublishers.ofString(encode(form))));
@@ -801,13 +906,16 @@ public class AuthVoClient {
         return json.readTree(r.body());
     }
 
-    /** URL-encode a map into an application/x-www-form-urlencoded body. */
-    private static String encode(Map<String, String> form) {
+    /**
+     * URL-encode {name, value} pairs, in order, into an application/x-www-form-urlencoded
+     * body. The same name may appear several times (RFC 8707 2).
+     */
+    static String encode(List<String[]> form) {
         StringBuilder sb = new StringBuilder();
-        for (Map.Entry<String, String> e : form.entrySet()) {
+        for (String[] e : form) {
             if (sb.length() > 0) sb.append('&');
-            sb.append(URLEncoder.encode(e.getKey(), StandardCharsets.UTF_8)).append('=')
-              .append(URLEncoder.encode(e.getValue(), StandardCharsets.UTF_8));
+            sb.append(URLEncoder.encode(e[0], StandardCharsets.UTF_8)).append('=')
+              .append(URLEncoder.encode(e[1], StandardCharsets.UTF_8));
         }
         return sb.toString();
     }
@@ -832,7 +940,7 @@ public class AuthVoClient {
     }
 
     /** The bits of the Authorization Server metadata we actually use. */
-    private static final class AsMetadata {
+    static final class AsMetadata {
         final String issuer, tokenEndpoint, deviceAuthorizationEndpoint, registrationEndpoint;
         AsMetadata(String iss, String te, String dae, String re) {
             this.issuer = iss; this.tokenEndpoint = te;
@@ -844,8 +952,12 @@ public class AuthVoClient {
     static final class ResourceCheck {
         final AsMetadata meta;     // the trusted issuer's endpoints
         final String resourceId;   // the protected_resources entry that covered our URL
+        final List<String> domainIds;  // every usable entry, the covering one first (AUDIENCE_DOMAIN)
         ResourceCheck(AsMetadata meta, String resourceId) {
-            this.meta = meta; this.resourceId = resourceId;
+            this(meta, resourceId, List.of(resourceId));
+        }
+        ResourceCheck(AsMetadata meta, String resourceId, List<String> domainIds) {
+            this.meta = meta; this.resourceId = resourceId; this.domainIds = domainIds;
         }
         String issuer() { return meta.issuer; }
         String tokenEndpoint() { return meta.tokenEndpoint; }
@@ -857,10 +969,27 @@ public class AuthVoClient {
     // ----------------------------------------------------------------- //
 
     /**
+     * Build a client from the AUTHVO_* settings ({@code env} looks a variable up; null = unset):
+     * AUTHVO_CLIENT_ID, AUTHVO_TOKEN_EXCHANGE ("1" = on) and AUTHVO_AUDIENCE ("covering", the
+     * default, or "domain"). Split out of {@link #main} so it can be tested.
+     *
+     * @throws IllegalArgumentException for an unknown AUTHVO_AUDIENCE
+     */
+    static AuthVoClient fromEnvironment(java.util.function.UnaryOperator<String> env) {
+        String audience = env.apply("AUTHVO_AUDIENCE");
+        return new AuthVoClient("openid vo.read", "vo.read", env.apply("AUTHVO_CLIENT_ID"),
+                "1".equals(env.apply("AUTHVO_TOKEN_EXCHANGE")),
+                audience == null ? AUDIENCE_COVERING : audience);
+    }
+
+    /**
      * Entry point: take a resource URL (argv[0] or env AUTHVO_RESOURCE) and run.
      * Env AUTHVO_CLIENT_ID supplies a preconfigured client_id (skips step 4);
      * AUTHVO_TOKEN_EXCHANGE=1 ALSO runs the RFC 8693 exchange (off by default; needs a
-     * client the IAM lets use that grant). A failed security check prints
+     * client the IAM lets use that grant). AUTHVO_AUDIENCE is "covering" (default: request
+     * the ONE protected_resources entry that covered the URL) or "domain" (request EVERY
+     * entry, repeating the RFC 8707 {@code resource} parameter, for a domain-wide token).
+     * A failed security check prints
      * "ABORT: ..." and exits 1, as does a resource that does not answer 200.
      */
     public static void main(String[] args) throws Exception {
@@ -869,9 +998,14 @@ public class AuthVoClient {
             System.err.println("usage: AuthVoClient <protected-resource-url>");
             System.exit(2);
         }
-        boolean exchange = "1".equals(System.getenv("AUTHVO_TOKEN_EXCHANGE"));
-        AuthVoClient client = new AuthVoClient("openid vo.read", "vo.read",
-                System.getenv("AUTHVO_CLIENT_ID"), exchange);
+        AuthVoClient client;
+        try {
+            client = fromEnvironment(System::getenv);
+        } catch (IllegalArgumentException e) {      // e.g. AUTHVO_AUDIENCE=everything
+            System.err.println("error: " + e.getMessage());
+            System.exit(2);
+            return;
+        }
         try {
             String body = client.access(resource);
             System.out.println("\n--- resource response ---");

@@ -62,5 +62,18 @@
     ["https://src.local.io/vo/d?q=a%20b", "https://src.local.io/vo/d?q=a+b", false, "no re-encoding of the query"],
     ["https://src.local.io/vo#top", "https://src.local.io/vo", true, "a fragment on the requested URL is never sent, so it is dropped"],
     ["https://src.local.io/vo", "https://src.local.io/vo#top", false, "a PRM resource must not carry a fragment (RFC 9728 1.2)"]
+  ],
+  "indicator": [
+    ["https://src.local.io/vo", true, "plain https URI"],
+    ["https://src.local.io", true, "origin only"],
+    ["https://src.local.io/vo?x=1", true, "a query is discouraged by RFC 8707 but not forbidden"],
+    ["http://localhost:8080/a", true, "other scheme and a port"],
+    ["https://src.local.io/vo#frag", false, "a fragment is forbidden (RFC 8707 2)"],
+    ["not-a-uri", false, "not absolute"],
+    ["/vo/resource", false, "a relative reference"],
+    ["//src.local.io/vo", false, "scheme-relative"],
+    ["mailto:someone@example.org", false, "no authority"],
+    ["https:///vo", false, "empty authority"],
+    ["", false, "empty"]
   ]
 }
