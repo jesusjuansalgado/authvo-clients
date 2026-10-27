@@ -349,7 +349,9 @@ for `/vo/...` lands on the wrong service. In the harness (`docker-compose.yml`):
 - "traefik.http.routers.rs.rule=Host(`src.local.io`) && (PathPrefix(`/vo`) || PathPrefix(`/.well-known/oauth-protected-resource/vo`))"
 ```
 
-A second service (say DataLink on `https://src.local.io/datalink`) would add its own router
+(The draft's note says the same from the other side: on a shared host, list per-service path prefixes,
+never an identifier covering the whole host, or one tenant's token could be presented to another's
+services.) A second service (say DataLink on `https://src.local.io/datalink`) would add its own router
 for `PathPrefix(`/datalink`)` and `PathPrefix(`/.well-known/oauth-protected-resource/datalink`)`,
 and be listed in `protected_resources` too. (`PathPrefix` is a *string* prefix, so the router
 also sends `/vocab` to this service; the service then answers `404` for it, because it owns
@@ -889,12 +891,14 @@ restrict who can change it, and review changes.
 
 ### 14.2 Step by step
 
-**1. Decide the identifiers.** One per protected service, normally its origin or a path
-prefix, written exactly as that service publishes it as the `resource` of its own PRM
+**1. Decide the identifiers.** One per protected service, normally the path prefix the service
+owns (`https://data.example.org/tap`), written exactly as that service publishes it as the `resource` of its own PRM
 (§6.1). A request URL is *covered* by an identifier if it is equal to it or extends it at a
 path-segment boundary, ignoring its query (§2), so `https://data.example.org` covers every URL on that
 service, whereas `https://data.example.org/tap` covers `/tap/async/1` but not `/tapx`.
-Prefer service-level identifiers over deep URLs. You list **one identifier per service**,
+Prefer service-level identifiers over deep URLs. **On a host shared by several services or projects,
+do not list an identifier that covers the whole host** (`https://data.example.org`): it would let one
+tenant's token be presented to another tenant's services (the draft's note on serving the PRM). You list **one identifier per service**,
 not one per URL: the resource server generates its PRM per request (§6.1), so its `resource`
 is the requested URL and never needs registering.
 
