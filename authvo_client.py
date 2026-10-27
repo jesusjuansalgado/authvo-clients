@@ -19,7 +19,8 @@ AuthVO closes that hole with two independent checks, both implemented below:
   1. The resource server publishes Protected Resource Metadata (PRM, RFC 9728)
      at ITS OWN well-known URL, and the 401 challenge only POINTS at it. The
      pointer is UNTRUSTED. The PRM must describe the resource we actually asked
-     for: its `resource` identifier must COVER the requested URL (step 2).
+     for: its `resource` must be IDENTICAL to the URL we requested, query
+     included (step 2; RFC 9728 3.3).
 
   2. But a resource server can say anything about itself, including "my issuer
      is the real IAM". So the binding is checked from the OTHER side (step 3):
@@ -41,8 +42,8 @@ THE FLOW, STEP BY STEP (numbers match the methods below)
 --------------------------------------------------------
   1  GET the protected resource anonymously (NO redirects). Expect
      401 + WWW-Authenticate: Bearer resource_metadata="<url>"   (UNTRUSTED pointer)
-  2  GET the PRM at that pointer over HTTPS (NO redirects). ABORT unless the
-     PRM `resource` covers the URL we asked for.        (RFC 9728 3; AuthVO 3.3.1)
+  2  GET the PRM at that pointer over HTTPS (NO redirects). ABORT unless the PRM
+     `resource` is IDENTICAL to the URL we requested, query included. (RFC 9728 3.3)
   3  RESOURCE CHECK (ABORT before any login on failure). For an issuer named in
      the PRM, GET its RFC 8414 metadata (NO redirects) and require
         (a) metadata `issuer` == the issuer the PRM named        (RFC 8414 3.3)
@@ -57,10 +58,13 @@ THE FLOW, STEP BY STEP (numbers match the methods below)
      expiry, and aud when present.
   7  (refresh would re-send the same `resource`; not implemented here)
 
-"Covered" (steps 2 and 3b) means: equal to the identifier, or the same scheme,
-host and port with a path that extends it at a path-SEGMENT boundary. So
-https://src.example.org/vo covers https://src.example.org/vo/tap/async/1 but NOT
-https://src.example.org/vocab; a root identifier covers its whole origin.
+"Covered" (step 3b ONLY) means: equal to the identifier, or the same scheme, host
+and port with a path that extends it at a path-SEGMENT boundary; any query of the
+requested URL is ignored. So https://src.example.org/vo covers
+https://src.example.org/vo/tap/async/1 and .../vo/datalink?ID=7 but NOT
+https://src.example.org/vocab; a root identifier covers its whole origin. The entries
+of the issuer's `protected_resources`, with the URLs they cover, form the
+AUTHENTICATION DOMAIN. Step 2 does NOT use coverage: it is an exact match.
 
 The token is requested for the resource id that matched in step 3(b), not for
 the dynamic deep URL the client started from. (So a DataLink deep link like
@@ -69,11 +73,10 @@ https://src.example.org, which is what the resource server expects.)
 
 WHERE THIS PROFILE DEPARTS FROM THE RFCs (deliberately; see README section 15)
 -------------------------------------------------------------------------------
-  * RFC 9728 3.3 asks for the PRM `resource` to be IDENTICAL to the identifier
-    the metadata URL was built from (or to the URL requested). The AuthVO draft
-    (3.3.1) relaxes this to COVERAGE (see is_covered) so that one identifier can
-    govern a service whose endpoints have variable paths. A client that follows
-    RFC 9728 to the letter would reject such a PRM for a deep URL.
+  * (Since the PR #23 review there is NO departure on the PRM: RFC 9728 3.3's
+    exact match is applied. A service whose paths vary generates its PRM per
+    request. Coverage is the AuthVO draft's rule for `protected_resources`, which
+    RFC 9728 does not define.)
   * RFC 9728 4 makes `protected_resources` OPTIONAL and says nothing about how a
     client uses it. The AuthVO draft makes it MANDATORY: absent = failure.
   * No redirect is ever followed (the RFCs are silent; this is stricter).
@@ -201,10 +204,12 @@ def is_covered(url: str, resource_id: str) -> bool:
     """Is `url` covered by the resource identifier `resource_id`?
 
     Covered means: the same origin (scheme, host, port), and a path that is equal
-    to the identifier's or extends it AT A PATH-SEGMENT BOUNDARY. This is the
-    AuthVO draft's rule (3.3.1): RFC 9728 3.3 asks for IDENTITY between the PRM's
-    `resource` and the URL, and AuthVO deliberately relaxes that to coverage so
-    that one service-level identifier governs deep URLs.
+    to the identifier's or extends it AT A PATH-SEGMENT BOUNDARY. Any query (or
+    fragment) of `url` is IGNORED: only origin and path decide. This is the AuthVO
+    draft's rule (3.3.1) for the entries of the issuer's `protected_resources`, which
+    RFC 9728 does not define; those entries and the URLs they cover form the
+    authentication domain. It is NOT used for the PRM `resource` (Step 2): that must
+    be identical to the requested URL (see urls_match_exactly).
 
         https://src.example.org            covers every path on that origin
         https://src.example.org/vo         covers /vo and /vo/tap/async/1,
@@ -457,10 +462,12 @@ class AuthVoClient:
 
         RFC 9728 section 3: the PRM is a JSON document published BY THE RESOURCE
         SERVER. We fetch it over HTTPS and refuse redirects. Then the `resource` it
-        declares must COVER the URL we asked for (see is_covered). RFC 9728 3.3
-        itself asks for an exact match; coverage is the AuthVO draft's relaxation
-        (3.3.1, 5.4.2). A PRM about some other resource is useless to us and is a
-        sign of spoofing, so we abort.
+        declares must be IDENTICAL to the URL we requested, query included (RFC 9728
+        3.3: for a PRM URL taken from a challenge, `resource` is the URL the client
+        used to request the resource server; see urls_match_exactly). The earlier
+        "covered by" relaxation was removed after the PR #23 review: a service whose
+        paths vary now generates its PRM per request instead. A PRM about any other
+        URL is useless to us and a sign of spoofing, so we abort.
         """
         require_https(pointer, "PRM pointer")
         log.info("STEP 2  GET PRM %s  (no redirects)", pointer)
@@ -476,11 +483,11 @@ class AuthVoClient:
             raise SecurityError("PRM did not list any authorization_servers")
         log.info("        resource=%s  authorization_servers=%s", resource, servers)
 
-        if not is_covered(resource_url, resource):
+        if not urls_match_exactly(resource_url, resource):
             raise SecurityError(
-                "STEP 2 FAILED: the PRM's resource %s does not cover the requested URL %s"
-                % (resource, resource_url))
-        log.info("        OK: PRM resource covers the requested URL")
+                "STEP 2 FAILED: the PRM's resource %s is not identical to the requested "
+                "URL %s (RFC 9728 3.3 requires an exact match)" % (resource, resource_url))
+        log.info("        OK: PRM resource is identical to the requested URL")
         return ProtectedResourceMetadata(url=pointer, resource=resource,
                                          authorization_servers=servers)
 
@@ -537,6 +544,7 @@ class AuthVoClient:
                                 "(an absent list is a failure)")
         if not isinstance(listed, list) or not all(isinstance(x, str) for x in listed):
             raise SecurityError("check (b): protected_resources is not a list of strings")
+        # coverage (NOT the exact match of step 2); any query of the URL is ignored
         matched = most_specific_cover(resource_url, listed)
         if matched is None:
             raise SecurityError("check (b): %s is not covered by the issuer's protected_resources %s"

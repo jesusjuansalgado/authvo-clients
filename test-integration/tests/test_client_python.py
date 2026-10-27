@@ -27,19 +27,23 @@ _spec.loader.exec_module(ac)
 
 VECTORS = json.loads((HERE / "coverage_vectors.json").read_text())
 
-RES_URL = "https://src.local.io/vo-resource"
-PRM_URL = "https://src.local.io/.well-known/oauth-protected-resource"
+RES_URL = "https://src.local.io/vo/resource"
+# RFC 9728 3.1: the PRM URL is derived from the REQUESTED URL (suffix between host and path)
+PRM_URL = "https://src.local.io/.well-known/oauth-protected-resource/vo/resource"
+SERVICE = "https://src.local.io/vo"           # the entry the IAM lists for the service
+DATALINK = "https://src.local.io/datalink"    # a second entry, listed but not the one requested
 ISSUER = "https://iam.local.io/"
 AS_URL = "https://iam.local.io/.well-known/oauth-authorization-server"
 OIDC_URL = "https://iam.local.io/.well-known/openid-configuration"
 
-PRM = {"resource": "https://src.local.io", "authorization_servers": [ISSUER]}
+# the PRM names EXACTLY the URL that was requested (RFC 9728 3.3)
+PRM = {"resource": RES_URL, "authorization_servers": [ISSUER]}
 AS_DOC = {
     "issuer": ISSUER,
     "token_endpoint": "https://iam.local.io/token",
     "device_authorization_endpoint": "https://iam.local.io/devicecode",
     "registration_endpoint": "https://iam.local.io/register",
-    "protected_resources": ["https://src.local.io"],
+    "protected_resources": [SERVICE, DATALINK],
 }
 CHALLENGE = 'Bearer resource_metadata="%s"' % PRM_URL
 
@@ -154,20 +158,51 @@ class Step1Probe(unittest.TestCase):
 class Step2Prm(unittest.TestCase):
     def test_ok(self):
         prm = client_with(good_routes())._step2_prm(RES_URL, PRM_URL)
-        self.assertEqual((prm.resource, prm.authorization_servers),
-                         ("https://src.local.io", [ISSUER]))
+        self.assertEqual((prm.resource, prm.authorization_servers), (RES_URL, [ISSUER]))
 
-    def test_resource_not_covering_requested_url_aborts(self):
-        routes = good_routes(**{PRM_URL: FakeResponse(200, dict(PRM, resource="https://src.local.io/other"))})
+    def step2(self, requested, resource, pointer=PRM_URL):
+        routes = {pointer: FakeResponse(200, dict(PRM, resource=resource))}
         c = client_with(routes)
-        with self.assertRaisesRegex(ac.SecurityError, "STEP 2 FAILED"):
-            c._step2_prm(RES_URL, PRM_URL)
+        prm = c._step2_prm(requested, pointer)
         self.assertEqual(c.http.posts, [])
+        return prm
+
+    def assertStep2Aborts(self, requested, resource):
+        c = client_with({PRM_URL: FakeResponse(200, dict(PRM, resource=resource))})
+        with self.assertRaisesRegex(ac.SecurityError, "STEP 2 FAILED"):
+            c._step2_prm(requested, PRM_URL)
+        self.assertEqual(c.http.posts, [], "must abort before any device request")
+
+    def test_a_different_resource_aborts(self):
+        self.assertStep2Aborts(RES_URL, "https://src.local.io/other")
+
+    def test_a_prm_that_merely_COVERS_the_request_aborts(self):
+        # The pre-review profile accepted this (the service identifier covers the URL);
+        # RFC 9728 3.3 does not: the resource must be the requested URL itself.
+        self.assertStep2Aborts(RES_URL, SERVICE)
+        self.assertStep2Aborts(RES_URL, "https://src.local.io")
+
+    def test_a_longer_resource_aborts(self):
+        self.assertStep2Aborts(SERVICE, RES_URL)
+
+    def test_the_query_is_part_of_the_identity(self):
+        with_query = RES_URL + "?ID=ivo%3A%2F%2Fx%2Fy&b=2"
+        self.step2(with_query, with_query, pointer=PRM_URL + "?ID=ivo%3A%2F%2Fx%2Fy&b=2")
+        self.assertStep2Aborts(with_query, RES_URL)                       # PRM drops the query
+        self.assertStep2Aborts(RES_URL, with_query)                       # PRM adds one
+        self.assertStep2Aborts(with_query, RES_URL + "?ID=other&b=2")     # a different query
+        self.assertStep2Aborts(RES_URL + "?a=1&b=2", RES_URL + "?b=2&a=1")  # order: no normalisation
+
+    def test_cosmetic_differences_are_tolerated_but_only_those(self):
+        self.step2("https://SRC.local.io:443/vo/resource/", RES_URL)      # host case, default port, 1 slash
+        self.assertStep2Aborts(RES_URL + "//", RES_URL)                   # two slashes are not one
+
+    def test_a_fragment_on_the_requested_url_is_dropped_but_not_on_the_resource(self):
+        self.step2(RES_URL + "#top", RES_URL)
+        self.assertStep2Aborts(RES_URL, RES_URL + "#top")
 
     def test_prm_about_another_origin_aborts(self):
-        routes = good_routes(**{PRM_URL: FakeResponse(200, dict(PRM, resource="https://evil.local.io"))})
-        with self.assertRaisesRegex(ac.SecurityError, "STEP 2 FAILED"):
-            client_with(routes)._step2_prm(RES_URL, PRM_URL)
+        self.assertStep2Aborts(RES_URL, "https://evil.local.io/vo/resource")
 
     def test_redirect_on_prm_fetch_is_refused(self):
         routes = good_routes(**{PRM_URL: FakeResponse(302, headers={"Location": PRM_URL + "2"}),
@@ -182,7 +217,7 @@ class Step2Prm(unittest.TestCase):
             client_with(good_routes())._step2_prm(RES_URL, PRM_URL.replace("https", "http"))
 
     def test_prm_without_servers_aborts(self):
-        routes = good_routes(**{PRM_URL: FakeResponse(200, {"resource": "https://src.local.io"})})
+        routes = good_routes(**{PRM_URL: FakeResponse(200, {"resource": RES_URL})})
         with self.assertRaisesRegex(ac.SecurityError, "authorization_servers"):
             client_with(routes)._step2_prm(RES_URL, PRM_URL)
 
@@ -194,22 +229,43 @@ class Step2Prm(unittest.TestCase):
 
 class Step3ResourceCheck(unittest.TestCase):
     def prm(self, *servers):
-        return ac.ProtectedResourceMetadata(PRM_URL, "https://src.local.io", list(servers or [ISSUER]))
+        return ac.ProtectedResourceMetadata(PRM_URL, RES_URL, list(servers or [ISSUER]))
 
     def check(self, routes, *servers):
         c = client_with(routes)
         return c, c._step3_resource_check(RES_URL, self.prm(*servers))
 
-    def test_passes_and_returns_matched_id_and_endpoints(self):
+    def test_passes_and_returns_the_covering_entry_and_endpoints(self):
         _, chk = self.check(good_routes())
-        self.assertEqual(chk.resource_id, "https://src.local.io")
+        # the audience entry comes from the IAM's list (the one that covers the URL),
+        # NOT from the PRM resource; the other listed entry does not cover the request
+        self.assertEqual(chk.resource_id, SERVICE)
         self.assertEqual(chk.meta.token_endpoint, "https://iam.local.io/token")
         self.assertEqual(chk.meta.issuer, ISSUER)
 
     def test_most_specific_listed_resource_is_chosen(self):
-        doc = dict(AS_DOC, protected_resources=["https://src.local.io", "https://src.local.io/vo-resource"])
+        doc = dict(AS_DOC, protected_resources=[SERVICE, RES_URL])
         _, chk = self.check(good_routes(**{AS_URL: FakeResponse(200, doc)}))
-        self.assertEqual(chk.resource_id, "https://src.local.io/vo-resource")
+        self.assertEqual(chk.resource_id, RES_URL)
+
+    def test_only_ONE_entry_has_to_cover_the_request(self):
+        # DATALINK is listed first but does not cover /vo/resource; SERVICE does
+        doc = dict(AS_DOC, protected_resources=[DATALINK, SERVICE])
+        _, chk = self.check(good_routes(**{AS_URL: FakeResponse(200, doc)}))
+        self.assertEqual(chk.resource_id, SERVICE)
+
+    def test_coverage_ignores_the_query_of_the_requested_url(self):
+        with_query = RES_URL + "?ID=ivo%3A%2F%2Fx%2Fy"
+        c = client_with(good_routes())
+        prm = ac.ProtectedResourceMetadata(PRM_URL, with_query, [ISSUER])
+        self.assertEqual(c._step3_resource_check(with_query, prm).resource_id, SERVICE)
+
+    def test_a_query_cannot_smuggle_a_listed_prefix_in(self):
+        doc = dict(AS_DOC, protected_resources=[SERVICE])
+        c = client_with(good_routes(**{AS_URL: FakeResponse(200, doc)}))
+        other = "https://src.local.io/other?next=/vo/x"
+        with self.assertRaisesRegex(ac.SecurityError, r"check \(b\).*not covered"):
+            c._step3_resource_check(other, ac.ProtectedResourceMetadata(PRM_URL, other, [ISSUER]))
 
     def assertAborts(self, routes, pattern, *servers):
         c = client_with(routes)
@@ -234,7 +290,7 @@ class Step3ResourceCheck(unittest.TestCase):
         self.assertAborts(good_routes(**{AS_URL: FakeResponse(200, doc)}), r"check \(b\).*not covered")
 
     def test_malformed_list_aborts(self):
-        self.assertAborts(good_routes(**{AS_URL: FakeResponse(200, dict(AS_DOC, protected_resources="https://src.local.io"))}),
+        self.assertAborts(good_routes(**{AS_URL: FakeResponse(200, dict(AS_DOC, protected_resources=SERVICE))}),
                           r"not a list of strings")
 
     def test_redirect_on_as_metadata_is_refused(self):
@@ -246,13 +302,13 @@ class Step3ResourceCheck(unittest.TestCase):
                           "HTTP 404")
 
     def test_oidc_used_only_to_read_missing_endpoints(self):
-        slim = {"issuer": ISSUER, "protected_resources": ["https://src.local.io"]}
+        slim = {"issuer": ISSUER, "protected_resources": [SERVICE]}
         c, chk = self.check(good_routes(**{AS_URL: FakeResponse(200, slim), OIDC_URL: FakeResponse(200, AS_DOC)}))
         self.assertIn(OIDC_URL, c.http.gets)
         self.assertEqual(chk.meta.device_authorization_endpoint, "https://iam.local.io/devicecode")
 
     def test_oidc_fallback_issuer_must_match_too(self):
-        slim = {"issuer": ISSUER, "protected_resources": ["https://src.local.io"]}
+        slim = {"issuer": ISSUER, "protected_resources": [SERVICE]}
         self.assertAborts(good_routes(**{AS_URL: FakeResponse(200, slim),
                                          OIDC_URL: FakeResponse(200, dict(AS_DOC, issuer="https://evil.example/"))}),
                           "OIDC discovery issuer")
