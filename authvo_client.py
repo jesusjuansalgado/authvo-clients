@@ -230,6 +230,64 @@ def most_specific_cover(url: str, resource_ids: list[str]) -> Optional[str]:
     return max(covering, key=lambda r: len(_normalized_path(r)), default=None)
 
 
+def _exact_parts(url: str):
+    """Split a URL into the parts the EXACT comparison uses (see urls_match_exactly).
+
+    Returns (key, has_fragment), or (None, False) if the URL cannot be parsed. The
+    key is (scheme, userinfo, host, port, path, has_query, query):
+      * scheme and host are lower-cased, and a default port (443 / 80) is dropped;
+      * the path is kept AS IS, apart from ONE trailing slash (so "/vo/" == "/vo"
+        and "https://h/" == "https://h", but "/vo//" != "/vo");
+      * the query is kept BYTE FOR BYTE, and "?" with nothing after it is not the
+        same as no query at all (has_query records the difference);
+      * the fragment is split off: a client never sends one.
+    """
+    before, hash_, _frag = url.partition("#")
+    try:
+        p = urlsplit(before)
+        port = p.port
+    except ValueError:
+        return None, False
+    scheme = (p.scheme or "").lower()
+    userinfo, at, _hostport = p.netloc.rpartition("@")
+    path = p.path[:-1] if p.path.endswith("/") else p.path       # ONE trailing slash
+    default = {"https": 443, "http": 80}.get(scheme)
+    key = (scheme, userinfo if at else None, (p.hostname or "").lower(),
+           None if port == default else port, path, "?" in before, p.query)
+    return key, bool(hash_)
+
+
+def urls_match_exactly(requested_url: str, prm_resource: str) -> bool:
+    """Step 2: is the PRM's `resource` IDENTICAL to the URL we requested?
+
+    RFC 9728 section 3.3: when the PRM URL came from the `resource_metadata`
+    parameter of a WWW-Authenticate challenge, the `resource` it returns MUST be
+    identical to the URL the client used to request the resource server, query
+    included; otherwise the PRM MUST NOT be used. (The AuthVO draft once relaxed
+    this to "covered by"; the relaxation was removed after the review of
+    ivoa-std/AuthVO PR #23. COVERAGE now applies only to the entries of the
+    issuer's `protected_resources` -- see is_covered.)
+
+    "Identical" is applied literally but sensibly: scheme and host are compared
+    case-insensitively and a default port is ignored; the path is compared as is,
+    apart from one trailing slash; the query is compared BYTE FOR BYTE -- no
+    re-ordering, no re-encoding, "?" is not "" -- because a service that makes
+    the query part of the resource's identity must be believed about exactly that
+    query. The requested URL's fragment is dropped (it is never sent); a PRM
+    `resource` that carries a fragment is never identical (RFC 9728 1.2).
+    Dot-segments are NOT resolved: an exact match must not be satisfied by a
+    different URL that happens to normalise to the same path.
+
+    This helper is shared by name with AuthVoClient.java and both are tested
+    against the `exact` vectors in tests/coverage_vectors.json.
+    """
+    requested, _ = _exact_parts(requested_url)
+    resource, resource_has_fragment = _exact_parts(prm_resource)
+    if requested is None or resource is None or resource_has_fragment:
+        return False
+    return requested == resource
+
+
 def require_https(url: str, what: str) -> None:
     """Refuse to talk to a non-HTTPS endpoint for any security-relevant URL.
 

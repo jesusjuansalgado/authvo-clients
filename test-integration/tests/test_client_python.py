@@ -104,6 +104,29 @@ class Coverage(unittest.TestCase):
                 self.assertEqual(ac.most_specific_cover(url, ids), expected)
 
 
+class ExactMatch(unittest.TestCase):
+    """Step 2 (RFC 9728 3.3): the PRM `resource` must be IDENTICAL to the requested URL,
+    query included. Same vectors as the Java client."""
+
+    def test_exact_vectors(self):
+        for requested, resource, expected, why in VECTORS["exact"]:
+            with self.subTest(requested=requested, resource=resource, why=why):
+                self.assertEqual(ac.urls_match_exactly(requested, resource), expected, why)
+
+    def test_is_symmetric_apart_from_the_fragment_rule(self):
+        # (a fragment is dropped on the requested side only, so symmetry is checked without)
+        for requested, resource, expected, why in VECTORS["exact"]:
+            if "#" in requested + resource:
+                continue
+            with self.subTest(requested=requested, resource=resource):
+                self.assertEqual(ac.urls_match_exactly(resource, requested), expected, why)
+
+    def test_unparseable_input_is_a_mismatch_not_a_crash(self):
+        for bad in ("https://[::1", "https://h:99999999/", "http://h:abc/x"):
+            self.assertFalse(ac.urls_match_exactly(bad, "https://h/x"))
+            self.assertFalse(ac.urls_match_exactly("https://h/x", bad))
+
+
 class Step1Probe(unittest.TestCase):
     def test_extracts_pointer(self):
         self.assertEqual(client_with(good_routes())._step1_probe(RES_URL), PRM_URL)

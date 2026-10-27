@@ -602,6 +602,62 @@ public class AuthVoClient {
         return best;
     }
 
+    /**
+     * Step 2: is the PRM's {@code resource} IDENTICAL to the URL we requested?
+     * <p>RFC 9728 section 3.3: when the PRM URL came from the {@code resource_metadata}
+     * parameter of a WWW-Authenticate challenge, the {@code resource} it returns MUST be
+     * identical to the URL the client used to request the resource server, query included;
+     * otherwise the PRM MUST NOT be used. (The AuthVO draft once relaxed this to "covered
+     * by"; the relaxation was removed after the review of ivoa-std/AuthVO PR #23. COVERAGE
+     * now applies only to the entries of the issuer's {@code protected_resources}: see
+     * {@link #isCovered}.)
+     * <p>"Identical" is applied literally but sensibly: scheme and host are compared
+     * case-insensitively and a default port is ignored; the path is compared as is, apart
+     * from ONE trailing slash; the query is compared BYTE FOR BYTE -- no re-ordering, no
+     * re-encoding, "?" is not "" -- because a service that makes the query part of the
+     * resource's identity must be believed about exactly that query. The requested URL's
+     * fragment is dropped (it is never sent); a PRM {@code resource} that carries a fragment
+     * is never identical (RFC 9728 1.2). Dot-segments are NOT resolved: an exact match must
+     * not be satisfied by a different URL that normalises to the same path.
+     * <p>Shared by name with authvo_client.py; both are tested against the {@code exact}
+     * vectors in tests/coverage_vectors.json.
+     */
+    static boolean urlsMatchExactly(String requestedUrl, String prmResource) {
+        List<String> requested = exactParts(requestedUrl);
+        List<String> resource = exactParts(prmResource);
+        if (requested == null || resource == null || prmResource.indexOf('#') >= 0) return false;
+        return requested.equals(resource);
+    }
+
+    /**
+     * The parts the exact comparison uses: scheme, user info, host, port, path (minus ONE
+     * trailing slash), whether there is a query, and the query -- scheme and host lower-cased,
+     * a default port dropped, the query untouched. Null if the URL cannot be parsed.
+     */
+    private static List<String> exactParts(String url) {
+        int hash = url.indexOf('#');
+        String before = hash >= 0 ? url.substring(0, hash) : url;     // the fragment is never sent
+        URI u;
+        try {
+            u = new URI(before);
+        } catch (java.net.URISyntaxException e) {
+            return null;
+        }
+        String scheme = u.getScheme() == null ? "" : u.getScheme().toLowerCase();
+        String host = u.getHost() != null ? u.getHost().toLowerCase()
+                : (u.getRawAuthority() == null ? "" : u.getRawAuthority().toLowerCase());
+        int dflt = scheme.equals("https") ? 443 : scheme.equals("http") ? 80 : -1;
+        int port = u.getPort() == dflt ? -1 : u.getPort();
+        String path = u.getRawPath() == null ? "" : u.getRawPath();
+        if (path.endsWith("/")) path = path.substring(0, path.length() - 1);   // ONE trailing slash
+        boolean hasQuery = before.indexOf('?') >= 0;
+        // "absent" must differ from "empty" (user info; "?" with nothing after it), so use a
+        // sentinel that cannot occur in a URL rather than the text "null".
+        String userInfo = u.getRawUserInfo() == null ? "\0" : u.getRawUserInfo();
+        String query = u.getRawQuery() == null ? "" : u.getRawQuery();
+        return List.of(scheme, userInfo, host, String.valueOf(port), path, String.valueOf(hasQuery), query);
+    }
+
     private static String stripTrailingSlash(String s) {
         while (s.endsWith("/")) s = s.substring(0, s.length() - 1);
         return s;

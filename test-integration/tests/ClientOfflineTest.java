@@ -184,6 +184,15 @@ public class ClientOfflineTest {
                             AuthVoClient.mostSpecificCover(v.get(0).asText(), ids)));
         }
 
+        System.out.println("exact match of the PRM resource (RFC 9728 3.3)");
+        for (JsonNode v : vectors.get("exact"))
+            test("exact: " + v.get(3).asText() + "  [" + v.get(0).asText() + " vs " + v.get(1).asText() + "]",
+                    () -> eq(v.get(2).asBoolean(), AuthVoClient.urlsMatchExactly(v.get(0).asText(), v.get(1).asText())));
+        test("exact: unparseable input is a mismatch, not a crash", () -> {
+            eq(false, AuthVoClient.urlsMatchExactly("https://h:abc/x", "https://h/x"));
+            eq(false, AuthVoClient.urlsMatchExactly("https://h/x", "https://h:abc/x"));
+        });
+
         System.out.println("step 1 - probe");
         test("extracts the pointer (quoted and bare)", () -> {
             eq(PRM_URL, AuthVoClient.parseResourceMetadata(CHALLENGE));
