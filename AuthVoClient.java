@@ -99,7 +99,7 @@ import java.util.regex.Pattern;
  *       MANDATORY (absent = failure).</li>
  *   <li>No redirect is ever followed (the RFCs are silent; this is stricter).</li>
  *   <li>The resource server checks {@code aud} only WHEN PRESENT; RFC 9068 4 would require
- *       it. INDIGO IAM 1.10 issues tokens without one (observed).</li>
+ *       it. INDIGO IAM 1.10 issues tokens without one; 1.15 sets it from {@code resource} (observed).</li>
  *   <li>RFC 9207 does not apply: it covers the iss parameter of authorization responses,
  *       which the device grant does not have.</li>
  * </ul>
@@ -575,7 +575,7 @@ public class AuthVoClient {
                 requireBearer(doc, "access token");    // the draft (5.4.5): present and Bearer
                 validateIssuer(doc, meta.issuer, "access token");
                 log("        -> access token acquired");
-                logAud(doc, "access token");
+                logAud(doc, "access token", audienceIds);
                 return doc;
             }
             String err = doc.path("error").asText("");
@@ -610,7 +610,7 @@ public class AuthVoClient {
         JsonNode doc = postForm(meta.tokenEndpoint, form);
         requireBearer(doc, "exchanged token");
         validateIssuer(doc, meta.issuer, "exchanged token");
-        logAud(doc, "exchanged token");
+        logAud(doc, "exchanged token", audienceIds);
         return doc;
     }
 
@@ -815,11 +815,32 @@ public class AuthVoClient {
     }
 
     /** Log a JWT token's aud for information. Never fails, never decides. */
-    private void logAud(JsonNode doc, String what) {
+    private void logAud(JsonNode doc, String what, List<String> requested) {
         Map<String, Object> payload = jwtPayload(doc.path("access_token").asText(""));
-        if (payload == null) log("        (%s is opaque; aud not inspectable)", what);
-        else log("        %s aud=%s (informational; the resource server enforces it)",
+        if (payload == null) { log("        (%s is opaque; aud not inspectable)", what); return; }
+        log("        %s aud=%s (informational; the resource server enforces it)",
                 what, payload.containsKey("aud") ? payload.get("aud") : "<absent>");
+        if (payload.containsKey("aud")) {
+            List<String> missing = audShortfall(payload.get("aud"), requested);
+            if (!missing.isEmpty())
+                log("        NOTE: %s requested for %d entries, but its aud does not name %s; "
+                        + "the issuer narrowed the audience (RFC 8707 2)", what, requested.size(), missing);
+        }
+    }
+
+    /**
+     * The entries we asked for (as {@code resource}) that the token's {@code aud} does not name.
+     * {@code aud} is a string or a list (RFC 7519 4.1.3). Used only to tell the user that the
+     * issuer narrowed the audience -- e.g. an IAM that takes only the FIRST of several repeated
+     * {@code resource} values (INDIGO IAM 1.15, README 7.4); never a trust decision. Nothing is
+     * "missing" when we asked for a single entry.
+     */
+    static List<String> audShortfall(Object aud, List<String> requested) {
+        List<String> missing = new ArrayList<>();
+        if (requested.size() < 2) return missing;
+        List<Object> granted = aud instanceof List ? new ArrayList<>((List<?>) aud) : new ArrayList<>(List.of(String.valueOf(aud)));
+        for (String r : requested) if (!granted.contains(r)) missing.add(r);
+        return missing;
     }
 
     /**

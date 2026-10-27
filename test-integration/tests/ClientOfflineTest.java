@@ -527,6 +527,16 @@ public class ClientOfflineTest {
             }
         });
 
+        System.out.println("aud shortfall (the issuer narrowed a multi-entry audience)");
+        test("one requested entry: nothing missing, even for a different aud", () -> {
+            eq(List.of(), AuthVoClient.audShortfall(SERVICE, List.of(SERVICE)));
+            eq(List.of(), AuthVoClient.audShortfall("https://elsewhere.example", List.of(SERVICE)));
+        });
+        test("a string aud naming one of two", () ->
+                eq(List.of(DATALINK), AuthVoClient.audShortfall(SERVICE, List.of(SERVICE, DATALINK))));
+        test("a list aud naming both", () ->
+                eq(List.of(), AuthVoClient.audShortfall(List.of(DATALINK, SERVICE, "x"), List.of(SERVICE, DATALINK))));
+
         System.out.println("step 5b - the prompt shows what the token is for");
         test("one entry", () -> {
             String out = prompt(List.of(SERVICE));

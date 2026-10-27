@@ -73,7 +73,7 @@ services:
       - trustanchors:/etc/grid-security/certificates
 
   iam:
-    image: indigoiam/iam-login-service:v1.10.0   # pin to a release you trust
+    image: indigoiam/iam-login-service:v1.15.0   # the release planned for production; pin to one you trust
     depends_on:
       db:
         condition: service_healthy

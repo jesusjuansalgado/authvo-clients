@@ -74,7 +74,7 @@ tls:
 YML
 
 # --- 3. IAM JWT signing key set --------------------------------------------
-# v1.10.0 ships no keystore and won't start without one. Generate a JWK set
+# The IAM (v1.10.0 and v1.15.0) ships no keystore and won't start without one. Generate a JWK set
 # (kid=rsa1) with the pure-JDK helper — no extra deps (JDK 11+ is already needed
 # for the Java client).
 if [ ! -f iam/keys/keystore.jwks ]; then

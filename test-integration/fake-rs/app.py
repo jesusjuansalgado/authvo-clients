@@ -35,7 +35,7 @@ Implements the bearer mechanism from the AuthVO "Security Challenges" talk:
         * if it carries an `aud`, that must include an identifier this service
           accepts (RS_AUDIENCE_IDS, default: the service identifier) which also
           COVERS the requested URL. `aud` is checked WHEN PRESENT but not
-          required: INDIGO IAM 1.10 issues tokens without one,
+          required: INDIGO IAM 1.10 issues tokens without one (1.15 sets it),
         * carry scope/context `vo.read`,
         * be unexpired.
     On success it returns the ASCII payload "protected resource data".

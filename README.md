@@ -189,6 +189,12 @@ authorization request *and* the token request (the device grant has no authoriza
 request, so the device authorization request is where the resource is first stated;
 RFC 8707 §2.2 allows it on the token request for every grant type).
 
+A warning for `audience="domain"`: an authorization server may narrow the audience (RFC 8707 §2 lets it), and
+**INDIGO IAM 1.15 uses only the first repeated `resource` value** (§7.4), so the token it issues names the
+covering entry only. The clients keep sending the standard repeated parameter and **log a `NOTE`** when a
+JWT's `aud` does not name every entry they asked for; the token is then refused, by a resource server that
+enforces `aud`, at the entries it does not name.
+
 ---
 
 ## 3. Repository layout
@@ -286,10 +292,10 @@ flowchart LR
   the local CA). The Java client needs JDK 11+ and Jackson (see `pom.xml`).
 
 > **Note on the IAM image.** The harness pins
-> `indigoiam/iam-login-service:v1.10.0`. It is an `amd64` image, so it runs under
-> emulation on Apple Silicon (slower first boot). Env var names and the bootstrap
-> mechanism move between INDIGO releases — §7 documents exactly what v1.10.0
-> needs.
+> `indigoiam/iam-login-service:v1.15.0`, the release planned for production. It is an `amd64`
+> image, so it runs under emulation on Apple Silicon (slower first boot). Env var names, profiles
+> and the bootstrap mechanism move between INDIGO releases — §7 documents exactly what the pinned
+> release needs, and what v1.10.0 (the earlier pin) did differently.
 
 ---
 
@@ -416,7 +422,7 @@ would be obvious.
 
 ## 7. INDIGO IAM — required configuration & provisioning
 
-A stock `indigoiam/iam-login-service:v1.10.0` started with the production-style
+A stock `indigoiam/iam-login-service:v1.15.0` started with the production-style
 `mysql` profile does **not** come up ready out of the box. The following changes
 are what make the flow work end to end. They live in `iam/iam.env` and
 `docker-compose.yml`.
@@ -428,17 +434,23 @@ are what make the flow work end to end. They live in `iam/iam.env` and
 #    Pin to the mysql set, or it finds two "V1" migrations and aborts at boot.
 SPRING_FLYWAY_LOCATIONS=classpath:db/migration/mysql
 
-# 2. The IAM_DB_* names are NOT honored by v1.10.0 — it falls back to embedded H2
-#    and runs the MySQL migrations against it (syntax error). Drive the datasource
-#    with the standard Spring Boot properties so it connects to MariaDB.
+# 2. The IAM_DB_* names were NOT honored by v1.10.0 — it fell back to embedded H2
+#    and ran the MySQL migrations against it (syntax error). Drive the datasource
+#    with the standard Spring Boot properties so it connects to MariaDB (v1.15.0
+#    was only run this way).
 SPRING_DATASOURCE_URL=jdbc:mysql://db:3306/iam
 SPRING_DATASOURCE_USERNAME=iam
 SPRING_DATASOURCE_PASSWORD=pwd
 SPRING_DATASOURCE_DRIVER_CLASS_NAME=com.mysql.cj.jdbc.Driver
 
-# 3. v1.10.0 ships NO signing keystore; the app won't start without one.
+# 3. The IAM ships NO signing keystore; the app won't start without one.
 #    Generate a JWK set (see 7.2) and point the IAM at it.
 IAM_KEY_STORE_LOCATION=file:/keystore.jwks
+
+# 3b. v1.15 only creates the keystore bean under the `prod` profile; without it the
+#    IAM stops at start-up ("No qualifying bean of type JwkKeyStore"). v1.10.0 did not
+#    need it.
+IAM_JAVA_OPTS=-Dspring.profiles.active=mysql,registration,prod -Djava.security.egd=file:/dev/./urandom
 
 # 4. Put the granted scopes INTO the JWT access token (default is false) so the
 #    resource server can enforce vo.read from the token itself.
@@ -530,17 +542,16 @@ server enforces `aud` **whenever the token has one** (it must include the
 resource) without *requiring* one; the signature, `iss`, `vo.read` and expiry are
 always checked.
 
-> **Observed with the pinned INDIGO IAM v1.10.0:** it *accepts* the `resource`
-> parameter but **ignores it** — the access token has no `aud` (the clients log
-> `aud=<absent>`). So against INDIGO the flow works, but the token is not
-> audience-bound unless the **optional token exchange** is used: with it on
-> (scenario 1c in §10) the exchanged token carries `aud=https://src.local.io/vo`.
-> Without an `aud` the resource server cannot tell a token minted for it from one
-> minted for another service this issuer serves, so deployments that want replay
-> protection against INDIGO should enable the exchange (or an issuer that honours
-> RFC 8707). Clients log the token's `aud` for information only and never fail
-on it. (Earlier versions of `human_demo` used INDIGO's non-standard `aud` request
-parameter; that is gone — the clients send `resource` only.)
+> **Observed with the pinned INDIGO IAM v1.15.0:** it honours the `resource` parameter —
+> the access token's `aud` is set from it (a single value; with several, the first only, see below),
+> so against INDIGO 1.15 the flow gives an audience-restricted token without the token exchange
+> (the clients log `aud=https://src.local.io/vo`). The earlier pin, **v1.10.0, ignored** `resource` and
+> issued tokens with no `aud`, so there the token was not audience-bound unless the **optional token
+> exchange** was used (scenario 1c in §10: the exchanged token carries `aud=https://src.local.io/vo`,
+> on both releases). Without an `aud` a resource server cannot tell a token minted for it from one
+> minted for another service this issuer serves. Clients log the token's `aud` for information only
+> and never fail on it. (Earlier versions of `human_demo` used INDIGO's non-standard `aud` request
+> parameter; that is gone — the clients send `resource` only.)
 
 > **Measured — several `resource` parameters** (scenario 9 in §10), on two INDIGO releases.
 > The clients, run with `AUTHVO_AUDIENCE=domain`, send `resource=https://src.local.io/vo` **and**
@@ -567,12 +578,12 @@ parameter; that is gone — the clients send `resource` only.)
 > `invalid_target`"; the Step 3 check stays the only protection), and it **does** reject a resource carrying a query,
 > which is why the audience must never be taken from the PRM `resource`. Releases between 1.10 and 1.15 were not tested.
 >
-> *To repeat this on another release* (the harness stays pinned to v1.10.0): run the stack as a separate
-> Compose project with an override that sets the `iam` image, e.g.
-> `COMPOSE_FILE=docker-compose.yml COMPOSE_PROJECT_NAME=iam115 docker compose -f docker-compose.yml -f override.yml up -d`,
-> then `./seed/provision.sh` and `python tests/run_scenarios.py --only 0,9`. For v1.15.0 the override also needs
-> `IAM_JAVA_OPTS: "-Dspring.profiles.active=mysql,registration,prod …"`: that release only creates the signing-keystore bean
-> under the `prod` profile. Provisioning and every scenario (0–9, both clients) ran unchanged against it: 22 of 22 verdicts passed.
+> *To repeat this on another release* (the harness is pinned to v1.15.0; this is how v1.10.0 was measured): run the stack as a separate
+> Compose project with an override that sets the `iam` image and, since the `prod` profile is not needed (and
+> harmless to drop) on 1.10, its `IAM_JAVA_OPTS`, e.g.
+> `COMPOSE_FILE=docker-compose.yml COMPOSE_PROJECT_NAME=iam110 docker compose -f docker-compose.yml -f override.yml up -d`,
+> then `./seed/provision.sh` and `python tests/run_scenarios.py --only 0,9`. Provisioning and every scenario
+> (0–9, both clients) ran unchanged against both releases.
 
 `DefaultClientRegistrationService` hard-codes
 `FORBIDDEN_GRANT_TYPES_FOR_ANONYMOUS` to include `token-exchange` and
@@ -877,12 +888,13 @@ your own IAM**: what you have to put in place, in what order, and how to check i
 ### 14.0 What this does — and does not — change
 
 **INDIGO IAM itself is not modified, and cannot be configured to do this.** We checked
-the pinned release (v1.10.0) directly: its discovery document
+the release pinned when this was first checked (v1.10.0) directly: its discovery document
 (`/.well-known/openid-configuration`, 34 members) has no `protected_resources`; it
 serves no RFC 8414 document at `/.well-known/oauth-authorization-server` (404); and the
 string `protected_resources` appears nowhere in the IAM's own compiled code (its 970 classes
 and two `iam-*` jars; a search for a member it does publish, `device_authorization_endpoint`,
-does find it). So the member is added **on
+does find it). On **v1.15.0**, the pinned release, the same holds as far as it was checked live: the OIDC discovery
+document has no `protected_resources` and the RFC 8414 URL answers `404` (the class search was not repeated). So the member is added **on
 the way out** by a small reverse proxy — the *augmenter* (`test-integration/augmenter/`)
 — that sits in front of exactly those two documents:
 
@@ -1075,10 +1087,10 @@ PRMs, and the service generates them per request.)
 
 | # | RFC | AuthVO profile (and these clients) | Consequence |
 |---|-----|------------------------------------|-------------|
-| 1 | **RFC 9728 §4**: `protected_resources` is *optional*, and the RFC does not say how a client uses it | **mandatory**; an absent list is a failure (draft §3.3.1, §5.4.3); a URL is *covered* by an entry if it is equal or extends it at a path-segment boundary, ignoring the query (the authentication domain) — a rule the RFC does not define | Issuers that do not publish it (INDIGO 1.10) need the augmenter, or clients refuse them |
+| 1 | **RFC 9728 §4**: `protected_resources` is *optional*, and the RFC does not say how a client uses it | **mandatory**; an absent list is a failure (draft §3.3.1, §5.4.3); a URL is *covered* by an entry if it is equal or extends it at a path-segment boundary, ignoring the query (the authentication domain) — a rule the RFC does not define | Issuers that do not publish it (INDIGO 1.10 and 1.15) need the augmenter, or clients refuse them |
 | 2 | RFCs silent on redirects | no redirect is followed on any discovery request, the token endpoint, or the bearer request (the draft requires it for the PRM and the AS metadata) | stricter than the draft |
-| 3 | **RFC 9068 §4**: a resource server must reject a JWT whose `aud` does not include itself (RFC 8707 §2: the AS should audience-restrict) | the resource server checks `aud` **only when present** (draft §5.4.6) | INDIGO 1.10 issues tokens **without `aud`**, so a leaked token is replayable at any resource the issuer lists, unless the optional token exchange is used (§7.4) |
-| 4 | RFC 9068 §2.1/§4: `typ` header `at+jwt` | not checked | INDIGO 1.10's access tokens carry no `typ` (observed) |
+| 3 | **RFC 9068 §4**: a resource server must reject a JWT whose `aud` does not include itself (RFC 8707 §2: the AS should audience-restrict) | the resource server checks `aud` **only when present** (draft §5.4.6) | INDIGO 1.10 issues tokens **without `aud`**, so a leaked token is replayable at any resource the issuer lists, unless the optional token exchange is used; INDIGO 1.15 sets `aud` from `resource` (§7.4) |
+| 4 | RFC 9068 §2.1/§4: `typ` header `at+jwt` | not checked | INDIGO 1.10's and 1.15's access tokens carry no `typ` header (observed) |
 
 ### 15.3 The implementation against the draft
 
@@ -1096,4 +1108,4 @@ PRMs, and the service generates them per request.)
 | §5.4.5 / RFC 8707 §2: a domain-wide token by repeating `resource` | ✅ clients (`audience="domain"`); ➖ **measured** (§7.4, scenario 9): INDIGO **1.10.0** accepts and ignores the repeated values (no `aud`); INDIGO **1.15.0** honours `resource` but takes only the **first** repeated value, so it does not issue a domain-wide token (a single space-separated value does, which RFC 8707 does not define) |
 | §3.3.1: the AS rejects a `resource` with a query (RFC 8707 §2 discourages it) | ✔ observed on INDIGO 1.15.0 (`invalid_target` at the consent page); 1.10.0 ignores it. Reason the audience never comes from the PRM `resource` |
 | RFC 9728 §3.3 / the draft: the service answers for variable paths | ✅ `fake-rs` generates the PRM per request, `404` outside its service path |
-| §3.3.1 note: the proxy "retrieves the server's live RFC 8414 metadata" | ➕ INDIGO 1.10 serves **no** RFC 8414 document (`404`); the augmenter derives one from its OIDC document (§6.2) |
+| §3.3.1 note: the proxy "retrieves the server's live RFC 8414 metadata" | ➕ INDIGO 1.10 and 1.15 serve **no** RFC 8414 document (`404`; checked live); the augmenter derives one from its OIDC document (§6.2) |

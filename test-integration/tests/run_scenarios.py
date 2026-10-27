@@ -327,8 +327,8 @@ def s1_happy(args, clients, creds, cid):
     run_each(clients, "1b", RESOURCE_URL, approve=True, creds=creds, client_id=None,
              check=expect_success)
     header("Scenario 1c - OPTIONAL token exchange switched on (AUTHVO_TOKEN_EXCHANGE=1): aud-bound token")
-    print(f"{DIM}INDIGO 1.10 ignores the `resource` indicator (no aud in the token above); the exchange is how "
-          f"an aud-bound token is obtained.{RESET}")
+    print(f"{DIM}INDIGO 1.10 ignores the `resource` indicator (no aud); 1.12+ honours it. Either way the optional "
+          f"exchange yields an aud-bound token (RFC 8693).{RESET}")
     run_each(clients, "1c", RESOURCE_URL, approve=True, creds=creds, client_id=cid,
              check=expect_exchange, env_extra={"AUTHVO_TOKEN_EXCHANGE": "1"})
 

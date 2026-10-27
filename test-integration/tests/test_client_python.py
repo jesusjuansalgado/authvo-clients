@@ -425,6 +425,40 @@ class AudienceOption(unittest.TestCase):
         self.assertEqual(c._audience_ids(chk), [SERVICE, DATALINK])
 
 
+class AudShortfall(unittest.TestCase):
+    """The user is told when the issuer narrowed a multi-entry audience (INDIGO 1.15 takes
+    only the first repeated `resource`); never a trust decision."""
+
+    AUD = [SERVICE, DATALINK]
+
+    @staticmethod
+    def doc(aud):
+        import base64
+        seg = base64.urlsafe_b64encode(json.dumps({"aud": aud}).encode()).decode().rstrip("=")
+        return {"access_token": "h.%s.s" % seg}
+
+    def test_nothing_missing_when_one_entry_was_requested(self):
+        self.assertEqual(ac.aud_shortfall(SERVICE, [SERVICE]), [])
+        self.assertEqual(ac.aud_shortfall("https://elsewhere.example", [SERVICE]), [])
+
+    def test_a_string_aud_names_only_one_of_two(self):
+        self.assertEqual(ac.aud_shortfall(SERVICE, self.AUD), [DATALINK])
+
+    def test_a_list_aud_naming_both_is_complete(self):
+        self.assertEqual(ac.aud_shortfall([SERVICE, DATALINK], self.AUD), [])
+        self.assertEqual(ac.aud_shortfall([DATALINK, SERVICE, "x"], self.AUD), [])
+
+    def test_the_note_is_logged_for_a_narrowed_token(self):
+        with self.assertLogs(ac.log, level="WARNING") as cm:
+            ac.AuthVoClient._log_aud(self.doc(SERVICE), "access token", self.AUD)
+        self.assertIn("narrowed the audience", cm.output[0])
+        self.assertIn(DATALINK, cm.output[0])
+
+    def test_no_note_when_nothing_was_narrowed(self):
+        with self.assertNoLogs(ac.log, level="WARNING"):
+            ac.AuthVoClient._log_aud(self.doc([SERVICE, DATALINK]), "access token", self.AUD)
+
+
 class Recorder:
     """A session that records every POST and answers from a script."""
 

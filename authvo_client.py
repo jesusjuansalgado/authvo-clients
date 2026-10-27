@@ -88,7 +88,7 @@ WHERE THIS PROFILE DEPARTS FROM THE RFCs (deliberately; see README section 15)
     client uses it. The AuthVO draft makes it MANDATORY: absent = failure.
   * No redirect is ever followed (the RFCs are silent; this is stricter).
   * The resource server checks `aud` only WHEN PRESENT; RFC 9068 4 would require
-    it. INDIGO IAM 1.10 issues tokens without `aud` (observed).
+    it. INDIGO IAM 1.10 issues tokens without `aud`; 1.15 sets it from `resource` (observed).
 
 RELEVANT STANDARDS
 ------------------
@@ -302,6 +302,20 @@ def urls_match_exactly(requested_url: str, prm_resource: str) -> bool:
     if requested is None or resource is None or resource_has_fragment:
         return False
     return requested == resource
+
+
+def aud_shortfall(aud, requested: list[str]) -> list[str]:
+    """The entries we asked for (as `resource`) that the token's `aud` does not name.
+
+    `aud` is a string or a list (RFC 7519 4.1.3). Used only to tell the user that the
+    issuer narrowed the audience, e.g. an IAM that takes only the first of several
+    repeated `resource` values; never a trust decision. Nothing is "missing" when we
+    asked for one entry: the question is only about a multi-entry request.
+    """
+    if len(requested) < 2:
+        return []
+    granted = [aud] if isinstance(aud, str) else list(aud or [])
+    return [r for r in requested if r not in granted]
 
 
 def is_valid_indicator(identifier: str) -> bool:
@@ -789,7 +803,7 @@ class AuthVoClient:
                 self._require_bearer(doc, "access token")
                 self._validate_issuer(doc, meta.issuer, "access token")
                 log.info("        -> access token acquired")
-                self._log_aud(doc, "access token")
+                self._log_aud(doc, "access token", audience_ids)
                 return doc
             err = doc.get("error")
             if err == "authorization_pending":
@@ -825,7 +839,7 @@ class AuthVoClient:
           + [("scope", self.exchange_scope)])
         self._require_bearer(doc, "exchanged token")
         self._validate_issuer(doc, meta.issuer, "exchanged token")
-        self._log_aud(doc, "exchanged token")
+        self._log_aud(doc, "exchanged token", audience_ids)
         return doc
 
     # -- step 6 ------------------------------------------------------------- #
@@ -851,14 +865,26 @@ class AuthVoClient:
     # -- shared HTTP / validation helpers ----------------------------------- #
 
     @staticmethod
-    def _log_aud(token_doc: dict, what: str) -> None:
-        """Log a JWT token's `aud` for information. Never fails, never decides."""
+    def _log_aud(token_doc: dict, what: str, requested: list[str] | None = None) -> None:
+        """Log a JWT token's `aud` for information. Never fails, never decides.
+
+        If we asked for several entries (audience="domain") and the token's `aud` names
+        fewer, say so: RFC 8707 2 lets an authorization server narrow the audience, and
+        INDIGO IAM 1.15 uses only the FIRST repeated `resource` value (README 7.4), so the
+        token would be refused, by a resource server that enforces `aud`, at the others.
+        """
         payload = jwt_payload(token_doc.get("access_token", ""))
         if payload is None:
             log.info("        (%s is opaque; aud not inspectable)", what)
-        else:
-            log.info("        %s aud=%s (informational; the resource server enforces it)",
-                     what, payload.get("aud", "<absent>"))
+            return
+        log.info("        %s aud=%s (informational; the resource server enforces it)",
+                 what, payload.get("aud", "<absent>"))
+        if "aud" in payload:
+            missing = aud_shortfall(payload["aud"], requested or [])
+            if missing:
+                log.warning("        NOTE: %s requested for %d entries, but its aud does not name %s; "
+                            "the issuer narrowed the audience (RFC 8707 2)", what,
+                            len(requested), missing)
 
     @staticmethod
     def _require_bearer(token_doc: dict, what: str) -> None:
