@@ -116,7 +116,7 @@ Ready. Run a demo from the demo/ directory, e.g. the guided one:
   # or the non-interactive driver:
   python auto_demo.py --username vouser --password vouser
   # or the preconfigured-client driver:
-  python demo.py --resource https://src.local.io/vo-resource \
+  python demo.py --resource https://src.local.io/vo/resource \
     --cacert ../certs/local-ca.pem --client-id-file ../seed/client_id
 
 Log in (device grant) as  vouser / vouser  (or admin / password); on approval
