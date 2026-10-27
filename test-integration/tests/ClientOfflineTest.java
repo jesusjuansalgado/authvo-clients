@@ -40,8 +40,11 @@ import javax.net.ssl.SSLSession;
  */
 public class ClientOfflineTest {
 
-    static final String RES_URL = "https://src.local.io/vo-resource";
-    static final String PRM_URL = "https://src.local.io/.well-known/oauth-protected-resource";
+    static final String RES_URL = "https://src.local.io/vo/resource";
+    // RFC 9728 3.1: the PRM URL is derived from the REQUESTED URL (suffix between host and path)
+    static final String PRM_URL = "https://src.local.io/.well-known/oauth-protected-resource/vo/resource";
+    static final String SERVICE = "https://src.local.io/vo";          // the entry the IAM lists for the service
+    static final String DATALINK = "https://src.local.io/datalink";   // listed, but not the one requested
     static final String ISSUER = "https://iam.local.io/";
     static final String AS_URL = "https://iam.local.io/.well-known/oauth-authorization-server";
     static final String OIDC_URL = "https://iam.local.io/.well-known/openid-configuration";
@@ -58,6 +61,10 @@ public class ClientOfflineTest {
     static Canned status(int s) { return new Canned(s, "", Map.of()); }
     static Canned redirect(int s, String to) { return new Canned(s, "", Map.of("Location", to)); }
     static Canned challenge() { return new Canned(401, "token not found", Map.of("WWW-Authenticate", CHALLENGE)); }
+    /** A 401 whose pointer is `pointer`: the PRM URL derived from the requested URL (RFC 9728 3.1). */
+    static Canned challengeTo(String pointer) {
+        return new Canned(401, "token not found", Map.of("WWW-Authenticate", "Bearer resource_metadata=\"" + pointer + "\""));
+    }
 
     /** GETs come from a table; any POST fails the test (the client must have aborted first). */
     static class FakeHttp extends HttpClient {
@@ -123,8 +130,8 @@ public class ClientOfflineTest {
     static Map<String, Canned> good(Object... overrides) {
         Map<String, Canned> r = new HashMap<>();
         r.put(RES_URL, challenge());
-        r.put(PRM_URL, ok(prm("https://src.local.io")));
-        r.put(AS_URL, ok(asDoc(ISSUER, "[\"https://src.local.io\"]")));
+        r.put(PRM_URL, ok(prm(RES_URL)));      // the PRM names EXACTLY the requested URL
+        r.put(AS_URL, ok(asDoc(ISSUER, "[\"" + SERVICE + "\",\"" + DATALINK + "\"]")));
         for (int i = 0; i < overrides.length; i += 2) r.put((String) overrides[i], (Canned) overrides[i + 1]);
         return r;
     }
@@ -205,14 +212,41 @@ public class ClientOfflineTest {
                 aborts(good(RES_URL, new Canned(401, "", Map.of("WWW-Authenticate", "Bearer"))), "resource_metadata"));
 
         System.out.println("step 2 - PRM");
-        test("PRM resource not covering the requested URL aborts", () ->
+        test("PRM naming a different resource aborts", () ->
                 aborts(good(PRM_URL, ok(prm("https://src.local.io/other"))), "STEP 2 FAILED"));
         test("PRM about another origin aborts", () ->
-                aborts(good(PRM_URL, ok(prm("https://evil.local.io"))), "STEP 2 FAILED"));
+                aborts(good(PRM_URL, ok(prm("https://evil.local.io/vo/resource"))), "STEP 2 FAILED"));
+        test("a PRM that merely COVERS the request aborts (the pre-review profile accepted it)", () -> {
+            aborts(good(PRM_URL, ok(prm(SERVICE))), "STEP 2 FAILED");
+            aborts(good(PRM_URL, ok(prm("https://src.local.io"))), "STEP 2 FAILED");
+        });
+        test("a longer PRM resource aborts", () ->
+                aborts(good(PRM_URL, ok(prm(RES_URL + "/deeper"))), "STEP 2 FAILED"));
+        test("the query is part of the identity", () -> {
+            String q = RES_URL + "?ID=ivo%3A%2F%2Fx%2Fy&b=2";
+            String pointer = PRM_URL + "?ID=ivo%3A%2F%2Fx%2Fy&b=2";
+            // the same query passes ...
+            FakeHttp ok = new FakeHttp(Map.of(q, challengeTo(pointer), pointer, ok(prm(q)),
+                    AS_URL, ok(asDoc(ISSUER, "[\"" + SERVICE + "\"]"))));
+            new AuthVoClient("openid vo.read", "vo.read", "authvo-client", false, ok).discover(q);
+            // ... and every variation aborts at step 2
+            for (String bad : new String[] {RES_URL, RES_URL + "?ID=other&b=2", RES_URL + "?b=2&ID=ivo%3A%2F%2Fx%2Fy",
+                    q + "&c=3"}) {
+                FakeHttp f = new FakeHttp(Map.of(q, challengeTo(pointer), pointer, ok(prm(bad)),
+                        AS_URL, ok(asDoc(ISSUER, "[\"" + SERVICE + "\"]"))));
+                try {
+                    new AuthVoClient("openid vo.read", "vo.read", "authvo-client", false, f).discover(q);
+                    throw new AssertionError("expected an abort for " + bad);
+                } catch (AuthVoClient.SecurityException e) {
+                    if (!e.getMessage().contains("STEP 2 FAILED")) throw new AssertionError(e.getMessage());
+                    eq(List.of(), f.posts);
+                }
+            }
+        });
         test("a redirect on the PRM fetch is refused and not followed", () -> {
             FakeHttp[] f = new FakeHttp[1];
             try {
-                discover(good(PRM_URL, redirect(302, PRM_URL + "2"), PRM_URL + "2", ok(prm("https://src.local.io"))), f);
+                discover(good(PRM_URL, redirect(302, PRM_URL + "2"), PRM_URL + "2", ok(prm(RES_URL))), f);
                 throw new AssertionError("expected an abort");
             } catch (AuthVoClient.SecurityException e) {
                 if (!e.getMessage().contains("redirect")) throw new AssertionError(e.getMessage());
@@ -220,21 +254,45 @@ public class ClientOfflineTest {
             }
         });
         test("PRM without authorization_servers aborts", () ->
-                aborts(good(PRM_URL, ok("{\"resource\":\"https://src.local.io\"}")), "authorization_servers"));
+                aborts(good(PRM_URL, ok("{\"resource\":\"" + RES_URL + "\"}")), "authorization_servers"));
         test("PRM that is not a JSON object aborts", () ->
                 aborts(good(PRM_URL, ok("[1,2]")), "not a JSON object"));
 
         System.out.println("step 3 - resource check");
-        test("passes; returns matched id and endpoints", () -> {
+        test("passes; returns the covering entry (from the IAM's list, not the PRM) and endpoints", () -> {
             AuthVoClient.ResourceCheck c = discover(good(), null);
-            eq("https://src.local.io", c.resourceId);
+            eq(SERVICE, c.resourceId);
             eq(ISSUER, c.issuer());
             eq("https://iam.local.io/token", c.tokenEndpoint());
         });
         test("the most specific listed resource is chosen", () -> {
             AuthVoClient.ResourceCheck c = discover(good(AS_URL,
-                    ok(asDoc(ISSUER, "[\"https://src.local.io\",\"https://src.local.io/vo-resource\"]"))), null);
-            eq("https://src.local.io/vo-resource", c.resourceId);
+                    ok(asDoc(ISSUER, "[\"" + SERVICE + "\",\"" + RES_URL + "\"]"))), null);
+            eq(RES_URL, c.resourceId);
+        });
+        test("only ONE entry has to cover the request", () -> {
+            AuthVoClient.ResourceCheck c = discover(good(AS_URL,
+                    ok(asDoc(ISSUER, "[\"" + DATALINK + "\",\"" + SERVICE + "\"]"))), null);
+            eq(SERVICE, c.resourceId);
+        });
+        test("coverage ignores the query of the requested URL", () -> {
+            String q = RES_URL + "?ID=ivo%3A%2F%2Fx%2Fy";
+            FakeHttp f = new FakeHttp(Map.of(q, challengeTo(PRM_URL + "?ID=ivo%3A%2F%2Fx%2Fy"), PRM_URL + "?ID=ivo%3A%2F%2Fx%2Fy", ok(prm(q)),
+                    AS_URL, ok(asDoc(ISSUER, "[\"" + SERVICE + "\"]"))));
+            eq(SERVICE, new AuthVoClient("openid vo.read", "vo.read", "authvo-client", false, f).discover(q).resourceId);
+        });
+        test("a query cannot smuggle a listed prefix in", () -> {
+            String other = "https://src.local.io/other?next=/vo/x";
+            FakeHttp f = new FakeHttp(Map.of(other,
+                    challengeTo("https://src.local.io/.well-known/oauth-protected-resource/other?next=/vo/x"),
+                    "https://src.local.io/.well-known/oauth-protected-resource/other?next=/vo/x", ok(prm(other)),
+                    AS_URL, ok(asDoc(ISSUER, "[\"" + SERVICE + "\"]"))));
+            try {
+                new AuthVoClient("openid vo.read", "vo.read", "authvo-client", false, f).discover(other);
+                throw new AssertionError("expected an abort");
+            } catch (AuthVoClient.SecurityException e) {
+                if (!e.getMessage().contains("check (b)")) throw new AssertionError(e.getMessage());
+            }
         });
         test("issuer mismatch aborts (check a)", () ->
                 aborts(good(AS_URL, ok(asDoc("https://evil.example/", "[\"https://src.local.io\"]"))), "check \\(a\\)"));
@@ -265,14 +323,14 @@ public class ClientOfflineTest {
         });
         test("every issuer failing aborts, listing the reasons", () -> {
             String other = "https://other.example/";
-            Map<String, Canned> r = good(PRM_URL, ok("{\"resource\":\"https://src.local.io\","
+            Map<String, Canned> r = good(PRM_URL, ok("{\"resource\":\"" + RES_URL + "\","
                     + "\"authorization_servers\":[\"" + other + "\",\"" + ISSUER + "\"]}"),
                     AS_URL, ok(asDoc(ISSUER, "[]")));
             aborts(r, "other\\.example.*HTTP 404.*iam\\.local\\.io");
         });
         test("the first issuer that passes is used", () -> {
             String other = "https://other.example/";
-            Map<String, Canned> r = good(PRM_URL, ok("{\"resource\":\"https://src.local.io\","
+            Map<String, Canned> r = good(PRM_URL, ok("{\"resource\":\"" + RES_URL + "\","
                     + "\"authorization_servers\":[\"" + other + "\",\"" + ISSUER + "\"]}"),
                     "https://other.example/.well-known/oauth-authorization-server", ok(asDoc(other, "[]")));
             eq(ISSUER, discover(r, null).issuer());

@@ -34,8 +34,8 @@ import java.util.regex.Pattern;
  * <ol>
  *   <li><b>Step 2 - the PRM.</b> The resource server publishes Protected Resource
  *       Metadata (RFC 9728) at ITS OWN well-known URL; the 401 only POINTS at it,
- *       and the pointer is UNTRUSTED. The PRM's {@code resource} must COVER the
- *       URL we asked for.</li>
+ *       and the pointer is UNTRUSTED. The PRM's {@code resource} must be IDENTICAL to
+ *       the URL we requested, query included (RFC 9728 3.3).</li>
  *   <li><b>Step 3 - the resource check.</b> A resource server can claim any issuer,
  *       so the binding is verified from the other side: the AUTHORIZATION
  *       SERVER's own RFC 8414 metadata must (a) carry the very issuer the PRM
@@ -54,7 +54,7 @@ import java.util.regex.Pattern;
  *   1  GET the protected resource anonymously (NO redirects). Expect
  *      401 + WWW-Authenticate: Bearer resource_metadata="..."   (UNTRUSTED pointer)
  *   2  GET the PRM at that pointer over HTTPS (NO redirects). ABORT unless the PRM
- *      resource covers the requested URL.               (RFC 9728 3; AuthVO 3.3.1)
+ *      resource is IDENTICAL to the requested URL, query included.   (RFC 9728 3.3)
  *   3  RESOURCE CHECK (ABORT before any login on failure): for an issuer named in
  *      the PRM, GET its RFC 8414 metadata (NO redirects) and require
  *        (a) metadata issuer == the issuer the PRM named          (RFC 8414 3.3)
@@ -68,18 +68,20 @@ import java.util.regex.Pattern;
  *      when present.
  *   7  (refresh would re-send the same resource; not implemented here)
  * </pre>
- * "Covered" means: equal to the identifier, or the same scheme, host and port
- * with a path that extends it at a path-SEGMENT boundary. So
- * {@code https://h/vo} covers {@code https://h/vo/tap/async/1} but not
- * {@code https://h/vocab}; a root identifier covers its whole origin.
+ * "Covered" (step 3b ONLY) means: equal to the identifier, or the same scheme, host and
+ * port with a path that extends it at a path-SEGMENT boundary; any query of the requested
+ * URL is ignored. So {@code https://h/vo} covers {@code https://h/vo/tap/async/1} and
+ * {@code https://h/vo/datalink?ID=7} but not {@code https://h/vocab}; a root identifier
+ * covers its whole origin. The entries of the issuer's {@code protected_resources}, with the
+ * URLs they cover, form the AUTHENTICATION DOMAIN. Step 2 does NOT use coverage: it is an
+ * exact match.
  *
  * <h2>Where this profile departs from the RFCs (deliberately; see README section 15)</h2>
  * <ul>
- *   <li>RFC 9728 3.3 asks for the PRM {@code resource} to be IDENTICAL to the identifier
- *       the metadata URL was built from (or to the URL requested). The AuthVO draft
- *       (3.3.1) relaxes this to COVERAGE so that one identifier can govern a service
- *       whose endpoints have variable paths; a client following RFC 9728 to the letter
- *       would reject such a PRM for a deep URL.</li>
+ *   <li>(Since the PR #23 review there is NO departure on the PRM: RFC 9728 3.3's exact
+ *       match is applied. A service whose paths vary generates its PRM per request.
+ *       Coverage is the AuthVO draft's rule for {@code protected_resources}, which
+ *       RFC 9728 does not define.)</li>
  *   <li>RFC 9728 4 makes {@code protected_resources} OPTIONAL; the AuthVO draft makes it
  *       MANDATORY (absent = failure).</li>
  *   <li>No redirect is ever followed (the RFCs are silent; this is stricter).</li>
@@ -233,9 +235,12 @@ public class AuthVoClient {
      * Step 2: fetch the PRM and require that it describes the resource we asked for.
      * RFC 9728 section 3: the PRM is a JSON document published BY THE RESOURCE SERVER;
      * we fetch it over HTTPS, refusing redirects. Then the {@code resource} it declares
-     * must COVER the requested URL ({@link #isCovered}). RFC 9728 3.3 itself asks for an
-     * exact match; coverage is the AuthVO draft's relaxation (3.3.1, 5.4.2). A PRM about
-     * some other resource is useless to us and a sign of spoofing, so we abort.
+     * must be IDENTICAL to the URL we requested, query included (RFC 9728 3.3: for a PRM
+     * URL taken from a challenge, {@code resource} is the URL the client used to request
+     * the resource server; see {@link #urlsMatchExactly}). The earlier "covered by"
+     * relaxation was removed after the PR #23 review: a service whose paths vary now
+     * generates its PRM per request instead. A PRM about any other URL is useless to us
+     * and a sign of spoofing, so we abort.
      */
     private Prm step2Prm(String resourceUrl, String pointer) throws Exception {
         requireHttps(pointer, "PRM pointer");
@@ -251,10 +256,11 @@ public class AuthVoClient {
             throw new SecurityException("PRM did not list any authorization_servers");
         log("        resource=%s  authorization_servers=%s", resource, servers);
 
-        if (!isCovered(resourceUrl, resource))
+        if (!urlsMatchExactly(resourceUrl, resource))
             throw new SecurityException("STEP 2 FAILED: the PRM's resource " + resource
-                    + " does not cover the requested URL " + resourceUrl);
-        log("        OK: PRM resource covers the requested URL");
+                    + " is not identical to the requested URL " + resourceUrl
+                    + " (RFC 9728 3.3 requires an exact match)");
+        log("        OK: PRM resource is identical to the requested URL");
         return new Prm(pointer, resource, servers);
     }
 
@@ -309,6 +315,7 @@ public class AuthVoClient {
         List<String> listed = stringList(pr);
         if (listed == null)
             throw new SecurityException("check (b): protected_resources is not a list of strings");
+        // coverage (NOT the exact match of step 2); any query of the URL is ignored
         String matched = mostSpecificCover(resourceUrl, listed);
         if (matched == null)
             throw new SecurityException("check (b): " + resourceUrl
@@ -574,9 +581,12 @@ public class AuthVoClient {
     /**
      * Is {@code url} covered by the resource identifier {@code resourceId}? Covered means
      * the same origin and a path equal to the identifier's or extending it AT A
-     * PATH-SEGMENT BOUNDARY. This is the AuthVO draft's rule (3.3.1): RFC 9728 3.3 asks
-     * for IDENTITY between the PRM's resource and the URL, and AuthVO relaxes that to
-     * coverage so that one service-level identifier governs deep URLs.
+     * PATH-SEGMENT BOUNDARY. Any query (or fragment) of {@code url} is IGNORED: only origin
+     * and path decide. This is the AuthVO draft's rule (3.3.1) for the entries of the
+     * issuer's {@code protected_resources}, which RFC 9728 does not define; those entries and
+     * the URLs they cover form the authentication domain. It is NOT used for the PRM
+     * {@code resource} (Step 2): that must be identical to the requested URL (see
+     * {@link #urlsMatchExactly}).
      * {@code https://h} covers every path on that origin; {@code https://h/vo} covers
      * /vo and /vo/tap/async/1 but NOT /vocab and NOT /vo/../other.
      */
