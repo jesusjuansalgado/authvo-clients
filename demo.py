@@ -5,7 +5,7 @@ the discovery checks in test-integration/demo/authvo_checks.py with the other
 drivers); this stub just runs it, so `python demo.py ...` from the repo root keeps
 working. Arguments are passed through unchanged:
 
-  python demo.py --resource https://src.local.io/vo-resource \
+  python demo.py --resource https://src.local.io/vo/resource \
       --cacert test-integration/certs/local-ca.pem \
       --client-id-file test-integration/seed/client_id
 """

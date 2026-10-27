@@ -12,12 +12,13 @@ flow the way a real client + real user would:
   * the client only ever uses the client_id it just obtained,
   * before any of that, the client REFUSES to proceed unless the issuer itself
     vouches for the resource (the resource check, step 3),
-  * the token request carries the matched resource as an RFC 8707 `resource`
-    indicator, so an issuer that supports it can bind the token's audience.
+  * the device authorization request AND the token request carry the audience as RFC 8707
+    `resource` indicators, taken from the ISSUER's list (never from the resource's own
+    metadata), so an issuer that supports it can bind the token's audience.
 
 It stops before every step and explains what is about to happen and why.
 
-  python human_demo.py --resource https://src.local.io/vo-resource \
+  python human_demo.py --resource https://src.local.io/vo/resource \
                        --cacert ../certs/local-ca.pem
 """
 import argparse
@@ -70,9 +71,13 @@ def refuse(msg):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--resource", default="https://src.local.io/vo-resource")
+    ap.add_argument("--resource", default="https://src.local.io/vo/resource")
     ap.add_argument("--cacert", default="../certs/local-ca.pem")
     ap.add_argument("--scope", default="vo.read")
+    ap.add_argument("--audience", choices=(chk.AUDIENCE_COVERING, chk.AUDIENCE_DOMAIN),
+                    default=chk.AUDIENCE_COVERING,
+                    help="covering: ask for a token for the ONE service entry covering the URL "
+                         "(default); domain: ask for every entry the IAM lists")
     ap.add_argument("--no-browser", action="store_true",
                     help="don't try to open the verification URL automatically")
     args = ap.parse_args()
@@ -110,16 +115,24 @@ def main():
              "by the RESOURCE SERVER about itself: which resource it is, and which",
              "authorization server(s) it says issue tokens for it.",
              "",
-             "Our only check here: the resource it describes must COVER the URL we",
-             "asked for (the same address, or one that starts with it at a '/'",
-             "boundary -- /vo covers /vo/tap/async/1 but not /vocab). A document",
-             "about some OTHER resource is useless to us, and a sign of spoofing.")
+             "Our only check here: the resource it describes must be EXACTLY the URL we",
+             "asked for -- character for character, query string included.",
+             "",
+             "Why so strict? This document is the service speaking about ITSELF. If we",
+             "accepted one that merely 'covers' our URL (say it describes /vo while we",
+             "asked for /vo/datalink?ID=7), any server could answer for paths it was",
+             "never asked about, and one document could be replayed for many URLs.",
+             "Requiring the exact URL means the service has looked at THIS request and",
+             "said: 'this is what I am, for this URL'. (A service with variable paths,",
+             "like TAP jobs, simply generates this small document on demand for",
+             "whatever URL it is asked about.) A document about some OTHER URL is",
+             "useless to us, and a sign of spoofing.")
         prm = chk.get_json(s, pointer, "Protected Resource Metadata")
         shown("resource described  :", prm.get("resource"))
         shown("authorization_servers:", prm.get("authorization_servers"))
         shown("scopes_supported    :", prm.get("scopes_supported"))
         issuers = chk.check_prm(args.resource, prm)
-        ok(f"OK: {prm['resource']} covers {args.resource}")
+        ok(f"OK: {prm['resource']} is identical to {args.resource}")
 
         # ---- STEP 3 --------------------------------------------------------- #
         step("3", "RESOURCE CHECK  (the security crux)",
@@ -135,6 +148,10 @@ def main():
              "      that issuer's document;",
              "  (b) 'protected_resources' lists a resource covering our URL -- the",
              "      issuer itself vouches that it issues tokens for this service.",
+             "      HERE 'covering' is the right test: the issuer lists whole SERVICES",
+             "      (e.g. https://src.local.io/vo) and the service's URLs below that",
+             "      path -- /vo covers /vo/tap/async/1 but not /vocab -- are in it. Any",
+             "      query string on our URL is ignored for this.",
              "If the issuer publishes NO list, we ABORT too: an unanswered question is",
              "not a yes. And all of this happens BEFORE you are asked to log in.")
         # Run the two gates one at a time (chk.resource_check does the same in one
@@ -153,6 +170,7 @@ def main():
                 resource_id = chk.check_b(as_doc, args.resource)
                 ok(f"gate (b) OK -> the issuer vouches for {resource_id}")
                 passed = (candidate, as_doc, resource_id, oidc_url)
+                audience = chk.audience_entries(as_doc, resource_id, args.audience)
                 break
             except chk.Abort as e:
                 print(f"{RED}  issuer {candidate} REJECTED: {e}{RESET}")
@@ -191,11 +209,26 @@ def main():
         # ---- STEP 5 --------------------------------------------------------- #
         step("5", "Start the device-authorization grant (RFC 8628)",
              "We send our client_id and the scopes we want. The IAM returns a code",
-             "the user will approve, plus the URL where they go to do it.")
-        da = s.post(ep["device_authorization_endpoint"], data={
-            "client_id": client_id,
-            "scope": f"openid {args.scope}",
-        }, allow_redirects=False).json()
+             "the user will approve, plus the URL where they go to do it.",
+             "",
+             "We also say WHAT the token is for, with the RFC 8707 'resource'",
+             "parameter -- and here we use the IAM's list, not the resource's own",
+             "document. Why? The resource's document names the exact URL we asked",
+             "for (it may even carry a query string, which an audience identifier",
+             "should not), and it comes from the party we are trying to be careful",
+             "with. The IAM's list names the SERVICES the IAM really issues tokens for,",
+             "and the IAM itself will be the one to mint the token. So the token is",
+             "asked for the service entry the IAM said covers our URL"
+             + (", and for every other entry in its list (a token for the whole domain)."
+                if args.audience == chk.AUDIENCE_DOMAIN else "."),
+             "(Device grant: there is no authorization request, so this is where the",
+             "resource is first stated; we repeat it when we ask for the token.)",
+             "",
+             *[f"   resource={e}" for e in audience])
+        da = s.post(ep["device_authorization_endpoint"], data=[
+            ("client_id", client_id),
+            ("scope", f"openid {args.scope}"),
+        ] + chk.resource_params(audience), allow_redirects=False).json()
         verify = da.get("verification_uri_complete") or da["verification_uri"]
         shown("user_code        :", da["user_code"])
         shown("verification_uri :", verify)
@@ -205,7 +238,7 @@ def main():
              "Now YOU act as the resource owner. Check what you are authorizing:",
              "",
              f"   Resource          : {args.resource}",
-             f"   Token is for      : {resource_id}",
+             *[f"   {'Token is for' if i == 0 else '':<17} : {e}" for i, e in enumerate(audience)],
              f"   Identity provider : {issuer}",
              "",
              "Open the URL below in a browser, log in with your IAM username/password",
@@ -227,15 +260,14 @@ def main():
         deadline = time.time() + da.get("expires_in", 600)
         token = None
         while time.time() < deadline:
-            tr = s.post(ep["token_endpoint"], data={
-                "grant_type": DEVICE_GRANT,
-                "device_code": da["device_code"],
-                "client_id": client_id,
-                # RFC 8707 resource indicator: the resource the issuer vouched for
-                # in step 3. An issuer that supports it binds the token's audience
-                # to it; one that does not simply ignores it.
-                "resource": resource_id,
-            }, allow_redirects=False)
+            tr = s.post(ep["token_endpoint"], data=[
+                ("grant_type", DEVICE_GRANT),
+                ("device_code", da["device_code"]),
+                ("client_id", client_id),
+                # RFC 8707 resource indicator(s): the entries of the IAM's list chosen
+                # in step 3, repeated once each. An issuer that supports it binds the
+                # token's audience to them; one that does not simply ignores them.
+            ] + chk.resource_params(audience), allow_redirects=False)
             body = tr.json()
             if tr.status_code == 200:
                 token = body["access_token"]

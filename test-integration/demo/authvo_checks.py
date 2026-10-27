@@ -7,12 +7,16 @@ are a deliberately plain port of the checks in the real client (authvo_client.py
 which is the reference): same rules, same RFC references.
 
   Step 1  probe: 401 + a `resource_metadata` pointer (UNTRUSTED)       RFC 9728 s5
-  Step 2  PRM from the resource server must COVER the requested URL    RFC 9728 s3; AuthVO 3.3.1
+  Step 2  the PRM's `resource` must be IDENTICAL to the requested URL  RFC 9728 s3.3
+            (query included; no "covered by" relaxation any more)
   Step 3  resource check on the ISSUER's own RFC 8414 metadata:
             (a) its `issuer` == the issuer the PRM named               RFC 8414 s3.3
             (b) `protected_resources` present AND covering the URL     RFC 9728 s4; AuthVO 3.3.1
-  Every metadata fetch refuses redirects. (Coverage instead of the exact match of RFC 9728
-3.3, and a MANDATORY protected_resources, are the AuthVO draft's profile, 3.3.1.)
+  Step 5  the token's AUDIENCE is taken from `protected_resources` (never from the PRM
+          `resource`) and sent as RFC 8707 `resource` parameters       RFC 8707 s2
+  Every metadata fetch refuses redirects. COVERAGE (a path-segment prefix rule) applies
+ONLY to the entries of `protected_resources`; a MANDATORY protected_resources is the
+AuthVO draft's profile (RFC 9728 4 makes it optional).
 
 Anything that fails raises Abort: the demo prints the reason and stops, before the
 user is ever asked to log in.
@@ -23,12 +27,65 @@ from urllib.parse import urlsplit, urlunsplit
 WELL_KNOWN_AS = "/.well-known/oauth-authorization-server"
 WELL_KNOWN_OIDC = "/.well-known/openid-configuration"
 
+# Which `protected_resources` entries the token is requested for (step 5).
+AUDIENCE_COVERING = "covering"      # only the entry that covered the requested URL
+AUDIENCE_DOMAIN = "domain"          # every entry: a domain-wide token
+
 
 class Abort(Exception):
     """A mandatory check failed: stop, send no token, ask for no login."""
 
 
-# --- "covered": the URL a request is for vs. a resource identifier -------------
+# --- Step 2: the EXACT match of the PRM `resource` (RFC 9728 3.3) --------------
+
+def _exact_parts(url):
+    """The parts the exact comparison uses: (key, has_fragment); (None, False) if unparseable.
+
+    Scheme and host are lower-cased and a default port is dropped; the path is kept as
+    is apart from ONE trailing slash; the query is kept byte for byte ("?" is not "");
+    the fragment is split off. Same rules as authvo_client.py (the reference).
+    """
+    before, hash_, _frag = url.partition("#")
+    try:
+        p = urlsplit(before)
+        port = p.port
+    except ValueError:
+        return None, False
+    scheme = (p.scheme or "").lower()
+    userinfo, at, _hostport = p.netloc.rpartition("@")
+    path = p.path[:-1] if p.path.endswith("/") else p.path
+    default = {"https": 443, "http": 80}.get(scheme)
+    key = (scheme, userinfo if at else None, (p.hostname or "").lower(),
+           None if port == default else port, path, "?" in before, p.query)
+    return key, bool(hash_)
+
+
+def urls_match_exactly(requested_url, prm_resource):
+    """Is the PRM's `resource` IDENTICAL to the URL we requested? (RFC 9728 3.3)
+
+    When the PRM URL came from a WWW-Authenticate `resource_metadata` pointer, its
+    `resource` MUST be identical to the requested URL, query included; otherwise the PRM
+    MUST NOT be used. A PRM that merely COVERS the URL is refused: the service itself
+    must say which URL it is describing. No normalisation beyond case of scheme/host,
+    the default port and one trailing slash; a PRM `resource` with a fragment never
+    matches (RFC 9728 1.2). Tested against the `exact` vectors shared with both clients.
+    """
+    requested, _ = _exact_parts(requested_url)
+    resource, resource_has_fragment = _exact_parts(prm_resource)
+    if requested is None or resource is None or resource_has_fragment:
+        return False
+    return requested == resource
+
+
+def is_valid_indicator(identifier):
+    """May `identifier` be sent as an RFC 8707 `resource` value? An absolute URI, no fragment."""
+    p = urlsplit(identifier)
+    return bool(p.scheme and p.netloc) and "#" not in identifier
+
+
+# --- Step 3: "covered" -- ONLY for the entries of protected_resources ----------
+
+# (Coverage ignores any query of the requested URL: _path() looks at the path only.)
 
 def _origin(url):
     p = urlsplit(url)
@@ -118,15 +175,21 @@ def as_metadata_urls(issuer):
 # --- the checks ----------------------------------------------------------------
 
 def check_prm(resource_url, prm):
-    """Step 2: the PRM must describe the resource we asked for. Returns the issuers."""
+    """Step 2: the PRM must describe EXACTLY the URL we asked for (RFC 9728 3.3).
+
+    Returns the issuers it names. The relaxation to "covered by" is gone since the
+    review of ivoa-std/AuthVO PR #23: a service whose paths vary generates a PRM per
+    request, with `resource` set to the URL it was asked about.
+    """
     resource = prm.get("resource")
     if not isinstance(resource, str) or not resource:
         raise Abort("the PRM has no `resource` member")
     servers = prm.get("authorization_servers")
     if not isinstance(servers, list) or not servers or not all(isinstance(s, str) for s in servers):
         raise Abort("the PRM names no authorization_servers")
-    if not is_covered(resource_url, resource):
-        raise Abort(f"the PRM's resource {resource} does not cover the requested URL {resource_url}")
+    if not urls_match_exactly(resource_url, resource):
+        raise Abort(f"the PRM's resource {resource} is not identical to the requested URL "
+                    f"{resource_url} (RFC 9728 3.3 requires an exact match)")
     return servers
 
 
@@ -150,7 +213,36 @@ def check_b(as_doc, resource_url):
     if matched is None:
         raise Abort(f"check (b): {resource_url} is not covered by the issuer's "
                     f"protected_resources {listed}")
+    if not is_valid_indicator(matched):
+        raise Abort(f"check (b): the covering entry {matched!r} is not a valid RFC 8707 "
+                    "resource indicator (absolute URI, no fragment)")
     return matched
+
+
+def audience_entries(as_doc, matched, mode=AUDIENCE_COVERING):
+    """The `protected_resources` entries the token is requested for (step 5).
+
+    The audience comes from the ISSUER's list, never from the PRM `resource` (which is
+    the requested URL, perhaps with a query that RFC 8707 says an indicator should not
+    carry). "covering": just the entry that covered the URL. "domain": every usable entry,
+    the covering one first, for a domain-wide token. Entries that are not valid indicators
+    are skipped.
+    """
+    if mode not in (AUDIENCE_COVERING, AUDIENCE_DOMAIN):
+        raise ValueError(f"audience must be {AUDIENCE_COVERING!r} or {AUDIENCE_DOMAIN!r}, not {mode!r}")
+    if mode == AUDIENCE_COVERING:
+        return [matched]
+    out = [matched]
+    for entry in as_doc.get("protected_resources") or []:
+        if entry not in out and is_valid_indicator(entry):
+            out.append(entry)
+    return out
+
+
+def resource_params(entries):
+    """The RFC 8707 `resource` parameter, REPEATED once per entry, as form pairs
+    (a dict cannot hold the same key twice)."""
+    return [("resource", e) for e in entries]
 
 
 def resource_check(session, resource_url, issuers):
