@@ -5,8 +5,9 @@
 //
 //   cd test-integration/demo
 //   java HumanDemo.java                       # uses sensible defaults
-//   java HumanDemo.java --resource https://src.local.io/vo-resource \
+//   java HumanDemo.java --resource https://src.local.io/vo/resource \
 //                       --cacert ../certs/local-ca.pem --no-browser
+//   (add --audience domain to ask for a token for EVERY service the IAM lists)
 //
 // Unlike Demo.java / auto_demo (which use a preconfigured client and/or fake the
 // human), this driver follows the flow the way a real client + real user would:
@@ -18,8 +19,9 @@
 //   * the client only ever uses the client_id it just obtained,
 //   * before any of that, the client REFUSES to proceed unless the issuer itself
 //     vouches for the resource (the resource check, step 3),
-//   * the token request carries the matched resource as an RFC 8707 `resource`
-//     indicator, so an issuer that supports it can bind the token's audience.
+//   * the device authorization request AND the token request carry the audience as RFC 8707
+//     `resource` indicators, taken from the ISSUER's list (never from the resource's own
+//     metadata), so an issuer that supports it can bind the token's audience.
 //
 // It stops before every step and explains what is about to happen and why.
 
@@ -80,7 +82,12 @@ public class HumanDemo {
 
     static void run(String[] args) throws Exception {
         Map<String, String> o = parseArgs(args);
-        String resource  = o.getOrDefault("resource", "https://src.local.io/vo-resource");
+        String resource  = o.getOrDefault("resource", "https://src.local.io/vo/resource");
+        String audienceMode = o.getOrDefault("audience", "covering");
+        if (!audienceMode.equals("covering") && !audienceMode.equals("domain")) {
+            System.err.println("error: --audience must be 'covering' or 'domain', not '" + audienceMode + "'");
+            System.exit(2);
+        }
         String cacert    = o.getOrDefault("cacert", "../certs/local-ca.pem");
         String scope     = o.getOrDefault("scope", "vo.read");
         boolean noBrowser = o.containsKey("no-browser");
@@ -122,10 +129,18 @@ public class HumanDemo {
                 "by the RESOURCE SERVER about itself: which resource it is, and which",
                 "authorization server(s) it says issue tokens for it.",
                 "",
-                "Our only check here: the resource it describes must COVER the URL we",
-                "asked for (the same address, or one that starts with it at a '/'",
-                "boundary -- /vo covers /vo/tap/async/1 but not /vocab). A document",
-                "about some OTHER resource is useless to us, and a sign of spoofing.");
+                "Our only check here: the resource it describes must be EXACTLY the URL we",
+                "asked for -- character for character, query string included.",
+                "",
+                "Why so strict? This document is the service speaking about ITSELF. If we",
+                "accepted one that merely 'covers' our URL (say it describes /vo while we",
+                "asked for /vo/datalink?ID=7), any server could answer for paths it was",
+                "never asked about, and one document could be replayed for many URLs.",
+                "Requiring the exact URL means the service has looked at THIS request and",
+                "said: 'this is what I am, for this URL'. (A service with variable paths,",
+                "like TAP jobs, simply generates this small document on demand for",
+                "whatever URL it is asked about.) A document about some OTHER URL is",
+                "useless to us, and a sign of spoofing.");
         String prm = getJson(http, pointer, "Protected Resource Metadata");
         String prmResource = jsonStr(prm, "resource");
         List<String> issuers = jsonStrArray(prm, "authorization_servers");
@@ -133,9 +148,10 @@ public class HumanDemo {
         shown("authorization_servers:", String.valueOf(issuers));
         if (prmResource == null) throw new Abort("the PRM has no `resource` member");
         if (issuers == null || issuers.isEmpty()) throw new Abort("the PRM names no authorization_servers");
-        if (!covered(resource, prmResource))
-            throw new Abort("the PRM's resource " + prmResource + " does not cover the requested URL " + resource);
-        System.out.println(G + "  OK: " + prmResource + " covers " + resource + X);
+        if (!urlsMatchExactly(resource, prmResource))
+            throw new Abort("the PRM's resource " + prmResource + " is not identical to the requested URL "
+                    + resource + " (RFC 9728 3.3 requires an exact match)");
+        System.out.println(G + "  OK: " + prmResource + " is identical to " + resource + X);
 
         // ---- STEP 3 --------------------------------------------------------
         step("3", "RESOURCE CHECK  (the security crux)",
@@ -151,11 +167,16 @@ public class HumanDemo {
                 "      that issuer's document;",
                 "  (b) 'protected_resources' lists a resource covering our URL -- the",
                 "      issuer itself vouches that it issues tokens for this service.",
+                "      HERE 'covering' is the right test: the issuer lists whole SERVICES",
+                "      (e.g. https://src.local.io/vo) and the service's URLs below that",
+                "      path -- /vo covers /vo/tap/async/1 but not /vocab -- are in it. Any",
+                "      query string on our URL is ignored for this.",
                 "If the issuer publishes NO list, we ABORT too: an unanswered question is",
                 "not a yes. And all of this happens BEFORE you are asked to log in.");
         // Run the two gates one at a time so each result is visible; the first
         // issuer passing both is used.
         String issuer = null, asDoc = null, resourceId = null, oidcUrl = null;
+        List<String> audience = null;
         List<String> failures = new ArrayList<>();
         for (String candidate : issuers) {
             try {
@@ -181,6 +202,10 @@ public class HumanDemo {
                     throw new Abort("check (b): " + resource + " is not covered by the issuer's "
                             + "protected_resources " + listed);
                 System.out.println(G + "  gate (b) OK -> the issuer vouches for " + matched + X);
+                if (!isValidIndicator(matched))
+                    throw new Abort("check (b): the covering entry '" + matched
+                            + "' is not a valid RFC 8707 resource indicator (absolute URI, no fragment)");
+                audience = audienceEntries(listed, matched, audienceMode);
                 issuer = candidate; asDoc = doc; resourceId = matched; oidcUrl = urls[1];
                 break;
             } catch (Abort a) {
@@ -231,12 +256,28 @@ public class HumanDemo {
         System.out.println(D + "   From here on, every request carries THIS client_id." + X);
 
         // ---- STEP 5 --------------------------------------------------------
-        step("5", "Start the device-authorization grant (RFC 8628)",
+        List<String> resLines = new ArrayList<>(List.of(
                 "We send our client_id and the scopes we want. The IAM returns a code",
-                "the user will approve, plus the URL where they go to do it.");
-        String da = form(http, deviceEp, Map.of(
-                "client_id", clientId,
-                "scope", "openid " + scope));
+                "the user will approve, plus the URL where they go to do it.",
+                "",
+                "We also say WHAT the token is for, with the RFC 8707 'resource'",
+                "parameter -- and here we use the IAM's list, not the resource's own",
+                "document. Why? The resource's document names the exact URL we asked",
+                "for (it may even carry a query string, which an audience identifier",
+                "should not), and it comes from the party we are trying to be careful",
+                "with. The IAM's list names the SERVICES the IAM really issues tokens for,",
+                "and the IAM itself will be the one to mint the token. So the token is",
+                "asked for the service entry the IAM said covers our URL"
+                        + (audienceMode.equals("domain")
+                                ? ", and for every other entry in its list (a token for the whole domain)." : "."),
+                "(Device grant: there is no authorization request, so this is where the",
+                "resource is first stated; we repeat it when we ask for the token.)",
+                ""));
+        for (String e : audience) resLines.add("   resource=" + e);
+        step("5", "Start the device-authorization grant (RFC 8628)", resLines.toArray(new String[0]));
+        List<String[]> daForm = pairs("client_id", clientId, "scope", "openid " + scope);
+        daForm.addAll(resourceParams(audience));
+        String da = form(http, deviceEp, daForm);
         String deviceCode = jsonStr(da, "device_code");
         String userCode   = jsonStr(da, "user_code");
         String verUri     = jsonStr(da, "verification_uri_complete");
@@ -247,11 +288,13 @@ public class HumanDemo {
         shown("verification_uri :", verUri);
 
         // ---- STEP 5b -------------------------------------------------------
-        step("5b", "HUMAN STEP: log in to the IAM and approve",
+        List<String> humanLines = new ArrayList<>(List.of(
                 "Now YOU act as the resource owner. Check what you are authorizing:",
                 "",
-                "   Resource          : " + resource,
-                "   Token is for      : " + resourceId,
+                "   Resource          : " + resource));
+        for (int i = 0; i < audience.size(); i++)
+            humanLines.add(String.format("   %-17s : %s", i == 0 ? "Token is for" : "", audience.get(i)));
+        humanLines.addAll(List.of(
                 "   Identity provider : " + issuer,
                 "",
                 "Open the URL below in a browser, log in with your IAM username/password",
@@ -260,7 +303,8 @@ public class HumanDemo {
                 "just polls and waits.",
                 "",
                 "   Open : " + verUri,
-                "   Code : " + userCode);
+                "   Code : " + userCode));
+        step("5b", "HUMAN STEP: log in to the IAM and approve", humanLines.toArray(new String[0]));
         if (!noBrowser) {
             try {
                 if (java.awt.Desktop.isDesktopSupported()
@@ -275,14 +319,13 @@ public class HumanDemo {
         String token = null;
         long deadline = System.currentTimeMillis() + expires * 1000L;
         while (System.currentTimeMillis() < deadline) {
-            HttpResponse<String> tr = formResp(http, tokenEp, Map.of(
-                    "grant_type", DEVICE_GRANT,
-                    "device_code", deviceCode,
-                    "client_id", clientId,
-                    // RFC 8707 resource indicator: the resource the issuer vouched for
-                    // in step 3. An issuer that supports it binds the token's audience
-                    // to it; one that does not simply ignores it.
-                    "resource", resourceId));
+            // RFC 8707 resource indicator(s): the entries of the IAM's list chosen in
+            // step 3, repeated once each. An issuer that supports it binds the token's
+            // audience to them; one that does not simply ignores them.
+            List<String[]> tokForm = pairs("grant_type", DEVICE_GRANT,
+                    "device_code", deviceCode, "client_id", clientId);
+            tokForm.addAll(resourceParams(audience));
+            HttpResponse<String> tr = formResp(http, tokenEp, tokForm);
             if (tr.statusCode() == 200) { token = jsonStr(tr.body(), "access_token"); break; }
             String err = jsonStr(tr.body(), "error");
             if (!"authorization_pending".equals(err) && !"slow_down".equals(err)) {
@@ -370,7 +413,78 @@ public class HumanDemo {
 
     static String orAbsent(String v) { return v == null ? "<absent>" : v; }
 
-    // --- the checks: "covered" (same rules as authvo_client.py / AuthVoClient.java) ---
+    // --- Step 2: the EXACT match of the PRM `resource` (RFC 9728 3.3) ---------------
+    // Same rules as authvo_client.py / AuthVoClient.java (shared `exact` vectors).
+
+    /** The parts the exact comparison uses, or null if the URL cannot be parsed. Scheme and
+     *  host lower-cased, default port dropped, path as is minus ONE trailing slash, query byte
+     *  for byte ("?" is not ""), fragment split off (last element: "#" present). */
+    static List<String> exactParts(String url) {
+        int hash = url.indexOf('#');
+        String before = hash < 0 ? url : url.substring(0, hash);
+        URI u;
+        try { u = new URI(before); } catch (java.net.URISyntaxException e) { return null; }
+        String scheme = u.getScheme() == null ? "" : u.getScheme().toLowerCase();
+        String auth = u.getRawAuthority() == null ? "" : u.getRawAuthority();
+        int at = auth.lastIndexOf('@');
+        String userinfo = at < 0 ? "\0" : auth.substring(0, at);
+        String hostport = auth.substring(at + 1);
+        String host = hostport, port = "";
+        int colon = hostport.lastIndexOf(':');
+        if (colon >= 0 && !hostport.endsWith("]")) {
+            host = hostport.substring(0, colon);
+            port = hostport.substring(colon + 1);
+            if (!port.matches("[0-9]*")) return null;
+        }
+        String dflt = scheme.equals("https") ? "443" : scheme.equals("http") ? "80" : "";
+        if (port.equals(dflt)) port = "";
+        String path = u.getRawPath() == null ? "" : u.getRawPath();
+        if (path.endsWith("/")) path = path.substring(0, path.length() - 1);
+        String query = u.getRawQuery() == null ? "" : u.getRawQuery();
+        return List.of(scheme, userinfo, host.toLowerCase(), port, path,
+                before.indexOf('?') >= 0 ? "?" : "-", query, hash >= 0 ? "#" : "-");
+    }
+
+    /** Is the PRM's `resource` IDENTICAL to the URL we requested? (RFC 9728 3.3.) A PRM that
+     *  merely COVERS the URL is refused; a PRM `resource` with a fragment never matches. */
+    static boolean urlsMatchExactly(String requested, String prmResource) {
+        List<String> a = exactParts(requested), b = exactParts(prmResource);
+        if (a == null || b == null || b.get(7).equals("#")) return false;
+        return a.subList(0, 7).equals(b.subList(0, 7));
+    }
+
+    /** May `identifier` be sent as an RFC 8707 `resource` value? An absolute URI, no fragment. */
+    static boolean isValidIndicator(String identifier) {
+        return identifier != null && identifier.indexOf('#') < 0
+                && Pattern.compile("^[A-Za-z][A-Za-z0-9+.\\-]*://[^/?#]+").matcher(identifier).find();
+    }
+
+    /** The `protected_resources` entries the token is requested for (step 5): "covering" = just
+     *  the entry that covered the URL; "domain" = every usable entry, that one first. The
+     *  audience comes from the ISSUER's list, never from the PRM `resource`. */
+    static List<String> audienceEntries(List<String> listed, String matched, String mode) {
+        List<String> out = new ArrayList<>(List.of(matched));
+        if (!mode.equals("domain")) return out;
+        for (String e : listed) if (!out.contains(e) && isValidIndicator(e)) out.add(e);
+        return out;
+    }
+
+    /** RFC 8707 `resource`, REPEATED once per entry (a Map cannot hold a key twice). */
+    static List<String[]> resourceParams(List<String> entries) {
+        List<String[]> out = new ArrayList<>();
+        for (String e : entries) out.add(new String[] {"resource", e});
+        return out;
+    }
+
+    /** Build a form from name, value, name, value ... */
+    static List<String[]> pairs(String... kv) {
+        List<String[]> out = new ArrayList<>();
+        for (int i = 0; i < kv.length; i += 2) out.add(new String[] {kv[i], kv[i + 1]});
+        return out;
+    }
+
+    // --- Step 3: "covered" -- ONLY for the entries of protected_resources ---
+    // (same rules as authvo_client.py / AuthVoClient.java; any query of the URL is ignored)
     // Equal to the identifier, or same origin and a path extending it at a path-SEGMENT
     // boundary (https://h/vo covers /vo/tap/async/1, not /vocab; a root id covers the
     // origin), with dot-segments resolved so /vo/../other is not "under" /vo.
@@ -448,12 +562,12 @@ public class HumanDemo {
                 HttpResponse.BodyHandlers.ofString());
     }
 
-    static HttpResponse<String> formResp(HttpClient c, String url, Map<String, String> form)
+    static HttpResponse<String> formResp(HttpClient c, String url, List<String[]> form)
             throws Exception {
         StringBuilder b = new StringBuilder();
-        for (Map.Entry<String, String> e : form.entrySet()) {
+        for (String[] e : form) {
             if (b.length() > 0) b.append('&');
-            b.append(enc(e.getKey())).append('=').append(enc(e.getValue()));
+            b.append(enc(e[0])).append('=').append(enc(e[1]));
         }
         return c.send(HttpRequest.newBuilder(URI.create(url))
                         .header("Content-Type", "application/x-www-form-urlencoded")
@@ -461,9 +575,10 @@ public class HumanDemo {
                 HttpResponse.BodyHandlers.ofString());
     }
 
-    static String form(HttpClient c, String url, Map<String, String> form) throws Exception {
+    static String form(HttpClient c, String url, List<String[]> form) throws Exception {
         return formResp(c, url, form).body();
     }
+
 
     static String enc(String s) {
         return java.net.URLEncoder.encode(s, StandardCharsets.UTF_8);

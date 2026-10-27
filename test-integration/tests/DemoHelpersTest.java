@@ -37,6 +37,43 @@ public class DemoHelpersTest {
         }
         eq("vectors parsed", true, n >= 15);
 
+        // The exact match of the PRM `resource` (RFC 9728 3.3): [requested, prm resource, bool, why]
+        String exact = vectors.substring(vectors.indexOf("\"exact\""), vectors.indexOf("\"indicator\""));
+        Matcher mx = Pattern.compile("\\[\"([^\"]*)\",\\s*\"([^\"]*)\",\\s*(true|false),").matcher(exact);
+        int nx = 0;
+        while (mx.find()) {
+            nx++;
+            boolean want = Boolean.parseBoolean(mx.group(3));
+            eq("Demo.urlsMatchExactly " + mx.group(1) + " vs " + mx.group(2), want, Demo.urlsMatchExactly(mx.group(1), mx.group(2)));
+            eq("HumanDemo.urlsMatchExactly " + mx.group(1) + " vs " + mx.group(2), want, HumanDemo.urlsMatchExactly(mx.group(1), mx.group(2)));
+        }
+        eq("exact vectors parsed", true, nx >= 20);
+
+        // RFC 8707 resource indicators: [url, bool, why]
+        String indicator = vectors.substring(vectors.indexOf("\"indicator\""));
+        Matcher mi = Pattern.compile("\\[\"([^\"]*)\",\\s*(true|false),").matcher(indicator);
+        int ni = 0;
+        while (mi.find()) {
+            ni++;
+            boolean want = Boolean.parseBoolean(mi.group(2));
+            eq("Demo.isValidIndicator '" + mi.group(1) + "'", want, Demo.isValidIndicator(mi.group(1)));
+            eq("HumanDemo.isValidIndicator '" + mi.group(1) + "'", want, HumanDemo.isValidIndicator(mi.group(1)));
+        }
+        eq("indicator vectors parsed", true, ni >= 8);
+
+        // The audience comes from the issuer's list; `resource` is repeated once per entry.
+        List<String> listed = List.of("https://src.local.io/datalink", "https://src.local.io/vo",
+                "https://src.local.io/x#frag", "not-a-uri", "https://src.local.io/vo");
+        String vo = "https://src.local.io/vo";
+        eq("Demo.audienceEntries covering", List.of(vo), Demo.audienceEntries(listed, vo, "covering"));
+        eq("Demo.audienceEntries domain", List.of(vo, "https://src.local.io/datalink"), Demo.audienceEntries(listed, vo, "domain"));
+        eq("HumanDemo.audienceEntries covering", List.of(vo), HumanDemo.audienceEntries(listed, vo, "covering"));
+        eq("HumanDemo.audienceEntries domain", List.of(vo, "https://src.local.io/datalink"), HumanDemo.audienceEntries(listed, vo, "domain"));
+        eq("Demo.resourceParams repeats", 2, Demo.resourceParams(List.of("a", "b")).size());
+        eq("HumanDemo.resourceParams repeats", 2, HumanDemo.resourceParams(List.of("a", "b")).size());
+        eq("HumanDemo.resourceParams name", "resource", HumanDemo.resourceParams(List.of("a")).get(0)[0]);
+        eq("Demo.pairs", "b", Demo.pairs("a", "b").get(0)[1]);
+
         List<String> ids = List.of("https://src.local.io", "https://src.local.io/vo");
         eq("Demo.mostSpecific", "https://src.local.io/vo", Demo.mostSpecific("https://src.local.io/vo/tap", ids));
         eq("HumanDemo.mostSpecific", "https://src.local.io/vo", HumanDemo.mostSpecific("https://src.local.io/vo/tap", ids));

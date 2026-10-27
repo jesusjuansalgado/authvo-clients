@@ -17,16 +17,23 @@ obtaining a real token for it. The agreed direction — as revised by
 
 - The resource server's `401` returns **only a pointer** (`resource_metadata`) to
   its **own** Protected Resource Metadata (PRM), published at its own well-known
-  URL. The pointer is untrusted; the PRM's `resource` must **cover the requested
-  URL** (equal to it, or same origin and a path extending it at a segment
-  boundary).
+  URL. The pointer is untrusted; the PRM's `resource` must be **identical to the
+  requested URL**, query included (RFC 9728 §3.3 — since the review of AuthVO PR #23
+  there is no "covered by" relaxation). A service with variable paths therefore
+  **generates the PRM per request** (`fake-rs`), and nothing is registered per URL.
 - The binding between resource and issuer is checked from the **issuer's** side
   (the **resource check**): its RFC 8414 metadata must carry the same `issuer` the
   PRM named *and* list the resource in **`protected_resources`** (RFC 9728 §4 defines it as
   optional; the AuthVO draft §3.3.1 makes it mandatory).
   An **absent** list is a failure, not a pass. This happens before any login.
-- The client uses the device grant and sends `resource=<matched id>` (RFC 8707).
-  RFC 8693 token exchange is **optional, off by default**. The resource server
+  **Coverage** (equal, or extending an entry at a path-segment boundary; the URL's query
+  is ignored) applies **only to these entries** — they plus the URLs they cover are the
+  *authentication domain*.
+- The client uses the device grant. The **audience comes from `protected_resources`,
+  never from the PRM `resource`**: the covering entry by default
+  (`audience="covering"`), every entry with `AUTHVO_AUDIENCE=domain`. `resource` (RFC 8707,
+  repeated per entry) goes on the device authorization request **and** the token request.
+  RFC 8693 token exchange is **optional, off by default** and uses the same list. The resource server
   enforces signature, `iss`, `vo.read`, expiry, and `aud` **only when present**.
 - No discovery request, nor any request carrying a bearer token, follows a redirect.
 
@@ -40,7 +47,7 @@ obtaining a real token for it. The agreed direction — as revised by
 | `test-integration/augmenter/` | **Metadata augmenter** (Python, stdlib): adds `protected_resources` to the IAM's `/.well-known/oauth-authorization-server` and `/openid-configuration`. An **interim emulation** — delete it (and its Traefik router) once INDIGO publishes the member |
 | `test-integration/augmenter/config/protected_resources.json` | Resource ids the augmenter publishes (read per request) |
 | `test-integration/traefik/traefik.yml` | Proxy + TLS; the two metadata paths go to the augmenter at priority 100 |
-| `test-integration/fake-rs/app.py` | Protected REST service (Flask): 401 + pointer, **serves its own PRM**, JWT checks; also the "evil" instance and the `RS_TEST_FAULTS` discovery fixtures |
+| `test-integration/fake-rs/app.py` | Protected REST service (Flask): 401 + pointer derived from the requested URL, **generates its PRM per request** (`RS_SERVICE_PATH` bounds it; 404 outside), JWT checks (`aud` when present must include an `RS_AUDIENCE_IDS` entry covering the request); also the "evil" instance and the `RS_TEST_FAULTS` fixtures under `/vo/faults/<name>/resource` |
 | `test-integration/seed/provision.sh` | Provisions the IAM (scope, users, `authvo-client`) |
 | `test-integration/demo/` | Reference (`demo.py`), non-interactive (`auto_demo.py`) and guided (`human_demo.py`, `HumanDemo.java`) drivers; shared checks in `authvo_checks.py` |
 | `test-integration/tests/` | Offline unit tests + `run_scenarios.py` (real clients vs. the live stack) |
@@ -56,12 +63,14 @@ obtaining a real token for it. The agreed direction — as revised by
 - **Don't reintroduce "IAM and the PRM must share an origin".** That was the old
   domain-proxy design. The security argument is the resource check (above), not
   where a document is hosted.
-- **RFC conformance:** coverage instead of RFC 9728 §3.3's exact match, a mandatory
-  `protected_resources` and `aud`-only-when-present are *deliberate AuthVO-profile departures*
-  (README §15). Never cite RFC 9728 §3.3 as the basis of the coverage rule, and RFC 9207
-  does not apply to the device grant.
-- The two clients must stay behaviourally identical; the URL-coverage rules are
-  pinned for both by `test-integration/tests/coverage_vectors.json`.
+- **RFC conformance:** Step 2 follows RFC 9728 §3.3 to the letter (exact match). A mandatory
+  `protected_resources` (with its coverage rule) and `aud`-only-when-present are *deliberate
+  AuthVO-profile departures* (README §15). Never use coverage for the PRM, never take the audience
+  from the PRM `resource`, and RFC 9207 does not apply to the device grant.
+- The two clients must stay behaviourally identical; the exact-match, coverage and
+  resource-indicator rules are pinned for both (and for the demos' copies) by the shared vectors in
+  `test-integration/tests/coverage_vectors.json` (`covered`, `most_specific`, `exact`, `indicator`;
+  `DemoHelpersTest` slices `covered` by position, so keep `exact` after it).
 
 ## Verifying
 
@@ -71,9 +80,11 @@ python -m unittest discover -s test-integration/tests -p "test_*.py"   # offline
 python test-integration/tests/run_scenarios.py --java-cp "$JACKSON"    # needs the stack up
 ```
 
-The scenarios: happy path, evil RS, `protected_resources` removed, PRM not covering,
-PRM redirect, resource-server token cases. Each abort scenario also asserts the
-client stopped before registration / the device grant.
+The scenarios: happy path, evil RS, `protected_resources` removed, PRM for another resource,
+PRM redirect, resource-server cases, variable paths and a query (7), a covering-but-not-equal PRM
+(8), and `AUTHVO_AUDIENCE=domain` (9, a *measurement* of what the IAM issues for several `resource`
+parameters, not pass/fail). Each abort scenario also asserts the client stopped before
+registration / the device grant.
 
 ## Open tasks (likely next steps)
 
@@ -91,10 +102,10 @@ client stopped before registration / the device grant.
 ```bash
 echo "127.0.0.1  iam.local.io src.local.io evil.local.io" | sudo tee -a /etc/hosts
 cd test-integration && ./setup.sh
-python demo/demo.py --resource https://src.local.io/vo-resource \
+python demo/demo.py --resource https://src.local.io/vo/resource \
   --cacert certs/local-ca.pem --client-id-file seed/client_id
 # or the Java demo:
-java demo/Demo.java --resource https://src.local.io/vo-resource \
+java demo/Demo.java --resource https://src.local.io/vo/resource \
   --cacert certs/local-ca.pem --client-id-file seed/client_id
 ```
 

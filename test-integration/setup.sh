@@ -74,7 +74,7 @@ tls:
 YML
 
 # --- 3. IAM JWT signing key set --------------------------------------------
-# v1.10.0 ships no keystore and won't start without one. Generate a JWK set
+# The IAM (v1.10.0 and v1.15.0) ships no keystore and won't start without one. Generate a JWK set
 # (kid=rsa1) with the pure-JDK helper — no extra deps (JDK 11+ is already needed
 # for the Java client).
 if [ ! -f iam/keys/keystore.jwks ]; then
@@ -116,7 +116,7 @@ Ready. Run a demo from the demo/ directory, e.g. the guided one:
   # or the non-interactive driver:
   python auto_demo.py --username vouser --password vouser
   # or the preconfigured-client driver:
-  python demo.py --resource https://src.local.io/vo-resource \
+  python demo.py --resource https://src.local.io/vo/resource \
     --cacert ../certs/local-ca.pem --client-id-file ../seed/client_id
 
 Log in (device grant) as  vouser / vouser  (or admin / password); on approval

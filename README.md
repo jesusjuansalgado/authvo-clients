@@ -32,21 +32,26 @@ departures listed in §15:
 * The resource server's `401` returns **only a pointer** (`resource_metadata`) to
   its **own** Protected Resource Metadata (PRM) document, which it publishes at
   its own well-known URL. The pointer is untrusted; the client only accepts a PRM
-  whose `resource` **covers the URL it asked for**. (RFC 9728 §3.3 asks for an *exact*
-  match; coverage is the AuthVO draft's deliberate relaxation, so one identifier can govern
-  a whole service.)
+  whose `resource` is **identical to the URL it asked for**, query included
+  (RFC 9728 §3.3). A service whose paths vary (TAP jobs, DataLink `?ID=`) therefore
+  **generates the PRM per request**; nothing is registered per URL.
 * But a resource server can say anything about itself, including "my issuer is
   the real IAM". So the binding is checked **from the other side**: the
   authorization server's own RFC 8414 metadata must name the same issuer **and
   list the resource in `protected_resources`**
   ([RFC 9728 §4](https://www.rfc-editor.org/rfc/rfc9728#section-4), where it is
   *optional*; the AuthVO draft makes it mandatory). Only the
-  issuer can vouch for which resources it serves. If it publishes no such list
+  issuer can vouch for which resources it serves. **Coverage** (a path-segment prefix
+  rule) applies only to these entries: an entry plus the URLs it covers form the
+  *authentication domain*. If it publishes no such list
   the client refuses: **absence is a failure, not a pass.** This *resource check*
   happens before the user is asked to log in.
-* The client uses the device grant and sends the matched resource as an
-  [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707) `resource` indicator, so a
-  cooperating issuer can bind the token's `aud`. (RFC 8693 token exchange can
+* The client uses the device grant and asks for the token's audience with
+  [RFC 8707](https://www.rfc-editor.org/rfc/rfc8707) `resource` indicators, on the
+  device authorization request **and** the token request. The audience comes from the
+  **issuer's** `protected_resources` (at least the entry that covered the URL; optionally
+  every entry), **never from the PRM `resource`**. A cooperating issuer can bind the
+  token's `aud` to it. (RFC 8693 token exchange can
   narrow it further, but is optional and off by default.) The resource server
   enforces `iss`, `vo.read`, expiry and — whenever the token carries one — `aud`.
 
@@ -56,19 +61,24 @@ departures listed in §15:
  1  GET the protected resource anonymously (no redirects)
     -> 401  WWW-Authenticate: Bearer resource_metadata="<PRM url>"   (UNTRUSTED pointer)
  2  GET the PRM at that pointer — the resource server's OWN RFC 9728 document —
-    over HTTPS, no redirects.  ABORT unless the PRM `resource` covers the
-    requested URL.
+    over HTTPS, no redirects.  ABORT unless the PRM `resource` is IDENTICAL to the
+    requested URL, query included (RFC 9728 3.3).  No "covered by" relaxation.
  3  RESOURCE CHECK (abort before any login).  For an issuer named in the PRM, GET
     its RFC 8414 metadata (no redirects) and require
        (a) metadata `issuer`  ==  the issuer the PRM named
-       (b) `protected_resources` present AND one entry covers the requested URL
+       (b) `protected_resources` present AND one entry COVERS the requested URL
+           (coverage applies here only; any query of the URL is ignored)
     The first listed issuer that passes both is used.  OIDC discovery is used only
     to read endpoints, never to skip (b).
  4  Obtain a client_id (preconfigured, or dynamic registration RFC 7591)
  5  Device authorization (RFC 8628): the user logs in and approves on the IAM's own
-    page (the client shows the resource AND the issuer); poll the token endpoint
-    sending  resource=<matched resource id>  (RFC 8707).
-    [optional, off by default: RFC 8693 token exchange]
+    page (the client shows the requested URL, the audience entries AND the issuer);
+    poll the token endpoint.  The AUDIENCE is taken from `protected_resources`, never
+    from the PRM: resource=<entry> (RFC 8707 2) goes on the device authorization
+    request AND on every token request, repeated for several entries
+    (audience="covering": the entry that covered the URL, the default;
+     audience="domain": every entry).
+    [optional, off by default: RFC 8693 token exchange, with the same list]
  6  Access the resource with the token (RS verifies signature/iss/scope/expiry,
     and aud when present)
  7  (refresh would re-send the same `resource` — not implemented in the reference clients)
@@ -88,17 +98,18 @@ sequenceDiagram
 
     rect rgba(33, 150, 243, 0.12)
     Note over C,RS: STEP 1 - probe (no redirects are ever followed)
-    C->>RS: GET /vo-resource (anonymous)
+    C->>RS: GET /vo/resource?ID=7 (anonymous)
     RS-->>C: 401 WWW-Authenticate: Bearer resource_metadata="PRM url"
     Note right of C: the pointer is UNTRUSTED
     end
 
     rect rgba(33, 150, 243, 0.12)
     Note over C,RS: STEP 2 - the resource server's own PRM (RFC 9728)
-    C->>RS: GET /.well-known/oauth-protected-resource (HTTPS)
+    C->>RS: GET /.well-known/oauth-protected-resource/vo/resource?ID=7 (HTTPS)
+    Note right of RS: generated per request:<br/>resource = the URL asked about
     RS-->>C: resource, authorization_servers, scopes_supported
-    alt the PRM resource does not cover the requested URL
-        Note over C: ABORT at step 2
+    alt the PRM resource is not IDENTICAL to the requested URL
+        Note over C: ABORT at step 2 (RFC 9728 3.3)
     end
     end
 
@@ -120,40 +131,69 @@ sequenceDiagram
 
     rect rgba(76, 175, 80, 0.14)
     Note over C,AS: STEP 5 - device grant and token
-    C->>AS: POST device authorization (RFC 8628)
+    Note over C: audience = entries of protected_resources<br/>(the covering one, or all) - never the PRM resource
+    C->>AS: POST device authorization (RFC 8628)<br/>resource = each audience entry (RFC 8707)
     AS-->>C: device_code, user_code, verification URL
-    C->>U: show the resource, the issuer, the URL and the code
+    C->>U: show the requested URL, the audience entries, the issuer, the URL and the code
     U->>AS: log in and approve (on the IAM's own page)
     loop until the user approves
-        C->>AS: POST token (device_code, resource = matched id, RFC 8707)
+        C->>AS: POST token (device_code, resource = each audience entry, RFC 8707)
         AS-->>C: authorization_pending, then the access token
     end
     opt token exchange enabled (off by default)
-        C->>AS: POST token exchange (audience = resource, RFC 8693)
-        AS-->>C: token bound to aud = resource
+        C->>AS: POST token exchange (audience = the same entries, RFC 8693)
+        AS-->>C: token bound to aud = those entries
     end
     end
 
     rect rgba(156, 39, 176, 0.12)
     Note over C,RS: STEP 6 - access
-    C->>RS: GET /vo-resource with Authorization: Bearer token (no redirects)
+    C->>RS: GET /vo/resource?ID=7 with Authorization: Bearer token (no redirects)
     RS->>AS: fetch the signing keys (JWKS)
     Note over RS: checks signature, iss, scope vo.read, expiry,<br/>and aud whenever the token carries one
     RS-->>C: 200 protected data (or 401 / 403)
     end
 ```
 
-**"Covered"** (steps 2 and 3b) means: equal to the identifier, or the same
-scheme, host and port with a path that extends it **at a path-segment
-boundary**. `https://src.local.io/vo` covers `https://src.local.io/vo/tap/async/1`
-but not `https://src.local.io/vocab`; a root identifier (`https://src.local.io`)
-covers its whole origin. Dot-segments are resolved first, so `/vo/../other` is not
-"under" `/vo`. Both clients are tested against the same vectors
-(`test-integration/tests/coverage_vectors.json`).
+**Step 2 is an exact match** (RFC 9728 §3.3). The PRM `resource` must be identical to the
+requested URL: scheme and host compared case-insensitively, the default port ignored, the
+path as is apart from one trailing slash, and the **query byte for byte** (no re-ordering,
+no re-encoding; `?` is not "no query"). A requested URL's fragment is dropped, since it is
+never sent; a PRM `resource` with a fragment never matches. Dot-segments are *not*
+resolved. A PRM that merely *covers* the URL (say `resource` = `https://src.local.io/vo`
+for a request to `…/vo/resource`) is refused: scenario 8 in §10.
 
-The token is requested for the identifier that matched in 3(b) — the most
-specific one if several match — not for the dynamic deep URL the client started
-from.
+**"Covered"** (step 3b **only**) means: equal to the identifier, or the same
+scheme, host and port with a path that extends it **at a path-segment
+boundary**; any query or fragment of the requested URL is ignored.
+`https://src.local.io/vo` covers `https://src.local.io/vo/tap/async/1` and
+`…/vo/datalink?ID=7` but not `https://src.local.io/vocab`; a root identifier
+(`https://src.local.io`) covers its whole origin. Dot-segments are resolved first, so
+`/vo/../other` is not "under" `/vo`. Both clients are tested against the same vectors
+(`test-integration/tests/coverage_vectors.json`: `covered`, `most_specific`, `exact`,
+`indicator`).
+
+**The audience** is requested for entries of the issuer's `protected_resources`, **not**
+for the PRM `resource` and not for the dynamic deep URL the client started from. Why: the
+PRM `resource` is the requested URL — it may carry a query, which RFC 8707 §2 says a
+resource indicator should not contain (INDIGO IAM rejects such values) — and it comes from
+the resource server, whereas the issuer's list names the services the issuer really
+issues tokens for and it is the issuer that mints the token. The default, `audience="covering"`
+(`AUTHVO_AUDIENCE=covering`), requests the entry that matched in 3(b) (the most specific one if
+several match), which is what the draft requires at least. `audience="domain"`
+(`AUTHVO_AUDIENCE=domain`) requests every entry, the covering one first, by **repeating**
+the `resource` parameter (RFC 8707 §2) — a domain-wide token. Entries that are not valid
+indicators (relative, or with a fragment) are skipped in `domain` mode; if the covering
+entry itself is invalid the client aborts at step 3. `resource` goes on the device
+authorization request *and* the token request (the device grant has no authorization
+request, so the device authorization request is where the resource is first stated;
+RFC 8707 §2.2 allows it on the token request for every grant type).
+
+A warning for `audience="domain"`: an authorization server may narrow the audience (RFC 8707 §2 lets it), and
+**INDIGO IAM 1.15 uses only the first repeated `resource` value** (§7.4), so the token it issues names the
+covering entry only. The clients keep sending the standard repeated parameter and **log a `NOTE`** when a
+JWT's `aud` does not name every entry they asked for; the token is then refused, by a resource server that
+enforces `aud`, at the entries it does not name.
 
 ---
 
@@ -174,7 +214,7 @@ from.
 | `test-integration/augmenter/` | **Metadata augmenter** (Python, stdlib): adds `protected_resources` to the IAM's metadata — an interim emulation (see §6) |
 | `test-integration/augmenter/config/protected_resources.json` | The resource identifiers the augmenter publishes |
 | `test-integration/traefik/traefik.yml` | Single-origin proxy + TLS |
-| `test-integration/fake-rs/` | The protected resource server (Flask); serves its own PRM; also the "evil" instance |
+| `test-integration/fake-rs/` | The protected resource server (Flask); **generates its PRM per request**; also the "evil" instance |
 | `test-integration/seed/provision.sh` | Provisions the IAM: vo.read scope, login users, authvo-client |
 | `test-integration/demo/demo.py` | Reference driver (interactive device flow) |
 | `test-integration/demo/auto_demo.py` | Non-interactive driver (auto-approves the login) |
@@ -252,10 +292,10 @@ flowchart LR
   the local CA). The Java client needs JDK 11+ and Jackson (see `pom.xml`).
 
 > **Note on the IAM image.** The harness pins
-> `indigoiam/iam-login-service:v1.10.0`. It is an `amd64` image, so it runs under
-> emulation on Apple Silicon (slower first boot). Env var names and the bootstrap
-> mechanism move between INDIGO releases — §7 documents exactly what v1.10.0
-> needs.
+> `indigoiam/iam-login-service:v1.15.0`, the release planned for production. It is an `amd64`
+> image, so it runs under emulation on Apple Silicon (slower first boot). Env var names, profiles
+> and the bootstrap mechanism move between INDIGO releases — §7 documents exactly what the pinned
+> release needs, and what v1.10.0 (the earlier pin) did differently.
 
 ---
 
@@ -265,16 +305,22 @@ Two documents carry the discovery, and **they come from different parties**:
 
 | Document | Published by | Says | Checked in |
 |----------|--------------|------|-----------|
-| PRM (RFC 9728) at `https://src.local.io/.well-known/oauth-protected-resource` | the **resource server** | "I am this resource; these issuers sign my tokens" | step 2 |
+| PRM (RFC 9728) at `https://src.local.io/.well-known/oauth-protected-resource/<path>[?<query>]`, **one per requested URL** | the **resource server** | "for *this URL* I am this resource; these issuers sign my tokens" | step 2 |
 | AS metadata (RFC 8414) at `https://iam.local.io/.well-known/oauth-authorization-server` | the **authorization server** | "these are the resources I serve" (`protected_resources`) | step 3 |
 
-### 6.1 The PRM (served by `fake-rs`)
+### 6.1 The PRM (generated per request by `fake-rs`)
 
-`fake-rs/app.py` builds the PRM from its environment — there is no static file:
+A service whose paths vary — TAP async jobs (`/vo/tap/async/<id>`), DataLink
+(`/vo/datalink?ID=…`) — cannot publish one static PRM file, and RFC 9728 §3.3 requires the
+PRM's `resource` to be *identical* to the URL the client requested. So `fake-rs/app.py`
+has **one handler** for `/.well-known/oauth-protected-resource/<path>` that answers every URL
+the service owns, with the same members each time and `resource` set to the URL it was
+asked about. There is no static file and **nothing is registered per URL**: the IAM still
+lists one identifier per service in `protected_resources`.
 
 ```json
 {
-  "resource": "https://src.local.io",
+  "resource": "https://src.local.io/vo/datalink?ID=ivo%3A%2F%2Fsrc.local.io%2Fobs%3Fid%3D42",
   "authorization_servers": ["https://iam.local.io/"],
   "scopes_supported": ["vo.read"],
   "bearer_methods_supported": ["header"]
@@ -283,15 +329,42 @@ Two documents carry the discovery, and **they come from different parties**:
 
 | Field | From | Meaning |
 |-------|------|---------|
-| `resource` | `RS_RESOURCE_ID` | The canonical id of the resource. Every protected URL must be covered by it (§2) and a token's `aud`, when present, must include it. |
+| `resource` | the **requested URL** | Rebuilt as `scheme://host` + `/<suffix>` + `?<query>` (RFC 9728 §3.1: the well-known suffix is *inserted between host and path*, and the query stays at the end). The query is kept **byte for byte**, percent-encoding included (the handler reads the raw request target). The JSON is built with `json.dumps`, so a query with quotes is escaped safely. |
 | `authorization_servers` | `RS_ISSUER` | Issuer(s) the resource accepts tokens from. The client trusts one **only after** the resource check. |
 | `scopes_supported` | `RS_REQUIRED_SCOPE` | Scopes the resource understands. |
 | `bearer_methods_supported` | — | `header` = `Authorization: Bearer`. |
 
-It is served at the RFC 9728 §3.1 URL: the well-known suffix is **inserted between
-the host and the path** of `RS_RESOURCE_ID` (`https://src.local.io/vo` would be
-published at `https://src.local.io/.well-known/oauth-protected-resource/vo`).
-`RS_PRM_URL` sets the pointer in the 401 challenge; it defaults to that URL.
+Configuration (all environment variables):
+
+| Variable | Default | Meaning |
+|----------|---------|---------|
+| `RS_RESOURCE_ID` | `https://src.local.io` | The **service identifier** — what the IAM lists in `protected_resources` for this service (`https://src.local.io/vo` in the harness). Its origin is the origin of every URL the server answers for. |
+| `RS_SERVICE_PATH` | the path of `RS_RESOURCE_ID` (else `/`) | The path this service **owns**, at a path-segment boundary: `/vo` owns `/vo` and `/vo/tap` but not `/vocab`. Anything else — a protected URL *or its PRM* — answers `404`, so the handler never claims URLs that belong to another tenant on a shared host. |
+| `RS_AUDIENCE_IDS` | `RS_RESOURCE_ID` | Space-separated identifiers a token's `aud` may name (§9). List several to accept domain-wide tokens. |
+
+The **401 challenge** points at the PRM *for the request*: the well-known URL derived from the
+URL that was asked, query included. The old fixed `RS_PRM_URL` is gone.
+
+### 6.1.1 Shared-host routing
+
+Several services can share one host (`src.local.io` here). Each one needs its own
+protected paths **and** its own well-known prefix routed to it, otherwise the PRM request
+for `/vo/...` lands on the wrong service. In the harness (`docker-compose.yml`):
+
+```yaml
+- "traefik.http.routers.rs.rule=Host(`src.local.io`) && (PathPrefix(`/vo`) || PathPrefix(`/.well-known/oauth-protected-resource/vo`))"
+```
+
+(The draft's note says the same from the other side: on a shared host, list per-service path prefixes,
+never an identifier covering the whole host, or one tenant's token could be presented to another's
+services.) A second service (say DataLink on `https://src.local.io/datalink`) would add its own router
+for `PathPrefix(`/datalink`)` and `PathPrefix(`/.well-known/oauth-protected-resource/datalink`)`,
+and be listed in `protected_resources` too. (`PathPrefix` is a *string* prefix, so the router
+also sends `/vocab` to this service; the service then answers `404` for it, because it owns
+paths by segment boundary — which is why `RS_SERVICE_PATH` matters.) The harness lists a second entry,
+`https://src.local.io/datalink`, in the IAM's metadata but does **not** serve it: it exists so the
+tests show that only one entry has to cover the request, and so the `domain` audience has
+something to request.
 
 ### 6.2 The metadata augmenter (`augmenter/app.py`)
 
@@ -300,7 +373,7 @@ the internal network, adds one member, and returns everything else unchanged
 (above all `issuer`):
 
 ```json
-"protected_resources": ["https://src.local.io"]
+"protected_resources": ["https://src.local.io/vo", "https://src.local.io/datalink"]
 ```
 
 * The list comes from `augmenter/config/protected_resources.json` and is read on
@@ -338,7 +411,8 @@ labels:
 ### 6.4 The "evil" resource server
 
 `evil.local.io` is a second `fake-rs` instance. Its 401 points at its own,
-perfectly well-formed PRM, which **names the real IAM** as its authorization
+perfectly well-formed PRM (generated for the requested URL, so it passes the exact match
+of step 2), which **names the real IAM** as its authorization
 server — exactly the attack — but `https://evil.local.io` is not in the IAM's
 `protected_resources`. Every client must therefore abort at the resource check,
 before registration or any login. Its payload reads "EVIL SERVICE" so a leak
@@ -348,7 +422,7 @@ would be obvious.
 
 ## 7. INDIGO IAM — required configuration & provisioning
 
-A stock `indigoiam/iam-login-service:v1.10.0` started with the production-style
+A stock `indigoiam/iam-login-service:v1.15.0` started with the production-style
 `mysql` profile does **not** come up ready out of the box. The following changes
 are what make the flow work end to end. They live in `iam/iam.env` and
 `docker-compose.yml`.
@@ -360,17 +434,23 @@ are what make the flow work end to end. They live in `iam/iam.env` and
 #    Pin to the mysql set, or it finds two "V1" migrations and aborts at boot.
 SPRING_FLYWAY_LOCATIONS=classpath:db/migration/mysql
 
-# 2. The IAM_DB_* names are NOT honored by v1.10.0 — it falls back to embedded H2
-#    and runs the MySQL migrations against it (syntax error). Drive the datasource
-#    with the standard Spring Boot properties so it connects to MariaDB.
+# 2. The IAM_DB_* names were NOT honored by v1.10.0 — it fell back to embedded H2
+#    and ran the MySQL migrations against it (syntax error). Drive the datasource
+#    with the standard Spring Boot properties so it connects to MariaDB (v1.15.0
+#    was only run this way).
 SPRING_DATASOURCE_URL=jdbc:mysql://db:3306/iam
 SPRING_DATASOURCE_USERNAME=iam
 SPRING_DATASOURCE_PASSWORD=pwd
 SPRING_DATASOURCE_DRIVER_CLASS_NAME=com.mysql.cj.jdbc.Driver
 
-# 3. v1.10.0 ships NO signing keystore; the app won't start without one.
+# 3. The IAM ships NO signing keystore; the app won't start without one.
 #    Generate a JWK set (see 7.2) and point the IAM at it.
 IAM_KEY_STORE_LOCATION=file:/keystore.jwks
+
+# 3b. v1.15 only creates the keystore bean under the `prod` profile; without it the
+#    IAM stops at start-up ("No qualifying bean of type JwkKeyStore"). v1.10.0 did not
+#    need it.
+IAM_JAVA_OPTS=-Dspring.profiles.active=mysql,registration,prod -Djava.security.egd=file:/dev/./urandom
 
 # 4. Put the granted scopes INTO the JWT access token (default is false) so the
 #    resource server can enforce vo.read from the token itself.
@@ -453,7 +533,8 @@ INSERT INTO client_grant_type(owner_id, grant_type)
 ### 7.4 Audience binding, and the token-exchange restriction
 
 The clients ask for audience binding with the RFC 8707 **`resource`** parameter on
-the device-grant token request, and stop there: RFC 8693 token exchange is
+the device authorization request **and** the device-grant token request — once per
+`protected_resources` entry they want in the audience (§2) — and stop there: RFC 8693 token exchange is
 **optional and off by default** (`AuthVoClient(token_exchange=True)`,
 `AUTHVO_TOKEN_EXCHANGE=1`, or `--token-exchange` on the demos). Whether the JWT
 that comes back carries an `aud` is up to the issuer — which is why the resource
@@ -461,17 +542,48 @@ server enforces `aud` **whenever the token has one** (it must include the
 resource) without *requiring* one; the signature, `iss`, `vo.read` and expiry are
 always checked.
 
-> **Observed with the pinned INDIGO IAM v1.10.0:** it *accepts* the `resource`
-> parameter but **ignores it** — the access token has no `aud` (the clients log
-> `aud=<absent>`). So against INDIGO the flow works, but the token is not
-> audience-bound unless the **optional token exchange** is used: with it on
-> (scenario 1c in §10) the exchanged token carries `aud=https://src.local.io`.
-> Without an `aud` the resource server cannot tell a token minted for it from one
-> minted for another service this issuer serves, so deployments that want replay
-> protection against INDIGO should enable the exchange (or an issuer that honours
-> RFC 8707). Clients log the token's `aud` for information only and never fail
-on it. (Earlier versions of `human_demo` used INDIGO's non-standard `aud` request
-parameter; that is gone — the clients send `resource` only.)
+> **Observed with the pinned INDIGO IAM v1.15.0:** it honours the `resource` parameter —
+> the access token's `aud` is set from it (a single value; with several, the first only, see below),
+> so against INDIGO 1.15 the flow gives an audience-restricted token without the token exchange
+> (the clients log `aud=https://src.local.io/vo`). The earlier pin, **v1.10.0, ignored** `resource` and
+> issued tokens with no `aud`, so there the token was not audience-bound unless the **optional token
+> exchange** was used (scenario 1c in §10: the exchanged token carries `aud=https://src.local.io/vo`,
+> on both releases). Without an `aud` a resource server cannot tell a token minted for it from one
+> minted for another service this issuer serves. Clients log the token's `aud` for information only
+> and never fail on it. (Earlier versions of `human_demo` used INDIGO's non-standard `aud` request
+> parameter; that is gone — the clients send `resource` only.)
+
+> **Measured — several `resource` parameters** (scenario 9 in §10), on two INDIGO releases.
+> The clients, run with `AUTHVO_AUDIENCE=domain`, send `resource=https://src.local.io/vo` **and**
+> `resource=https://src.local.io/datalink` on the device authorization request and on every token
+> poll. Direct probes with the same user and client show what each IAM does with them:
+>
+> | `resource` sent | v1.10.0 | v1.15.0 |
+> |-----------------|---------|---------|
+> | none | no `aud` | no `aud` |
+> | one listed value | no `aud` (ignored) | `aud` = that value |
+> | `[service, datalink]` (the clients' order) | no `aud` | `aud` = **`service` only** |
+> | `[datalink, service]` (reversed) | no `aud` | `aud` = **`datalink` only** |
+> | `[service, datalink, unlisted]` | no `aud` | `aud` = `service` only |
+> | one value **not** in `protected_resources` | token issued, no `aud` | token issued, **`aud` = that unlisted value** (no `invalid_target`) |
+> | one value **with a query** | accepted, ignored | device authorization accepted, then the consent page fails with `invalid_target`: *"The resource indicator contains a query component"* — no token |
+> | **one space-separated value** `"service datalink"` (not RFC 8707; measured only, the clients never send it) | no `aud` | `aud` = **both**, as a list |
+>
+> So **v1.10.0 ignores `resource`**, repeated or not, and issues no `aud`. **v1.15.0 honours it but uses only the
+> *first* repeated value** (the order decides which), so `audience="domain"` does **not** yield a domain-wide token from
+> INDIGO 1.15: the covering entry is sent first, so the token is audience-restricted to the covering entry, as
+> with `audience="covering"`. Only a single space-separated value gave a multi-entry `aud`; that is not what RFC 8707
+> specifies and the clients do not send it (a client option for IAMs that need it would be a separate decision).
+> Two more facts from the same probes: v1.15.0 does **not** reject an unlisted resource (the draft's "SHOULD
+> `invalid_target`"; the Step 3 check stays the only protection), and it **does** reject a resource carrying a query,
+> which is why the audience must never be taken from the PRM `resource`. Releases between 1.10 and 1.15 were not tested.
+>
+> *To repeat this on another release* (the harness is pinned to v1.15.0; this is how v1.10.0 was measured): run the stack as a separate
+> Compose project with an override that sets the `iam` image and, since the `prod` profile is not needed (and
+> harmless to drop) on 1.10, its `IAM_JAVA_OPTS`, e.g.
+> `COMPOSE_FILE=docker-compose.yml COMPOSE_PROJECT_NAME=iam110 docker compose -f docker-compose.yml -f override.yml up -d`,
+> then `./seed/provision.sh` and `python tests/run_scenarios.py --only 0,9`. Provisioning and every scenario
+> (0–9, both clients) ran unchanged against both releases.
 
 `DefaultClientRegistrationService` hard-codes
 `FORBIDDEN_GRANT_TYPES_FOR_ANONYMOUS` to include `token-exchange` and
@@ -516,22 +628,30 @@ subjectAltName = DNS:iam.local.io, DNS:src.local.io, DNS:evil.local.io
 
 A small Flask service standing in for a TAP/DataLink/SODA endpoint.
 
-* Unauthenticated `GET /vo-resource` (or `GET /datalink/download/...`) →
-  `401` with `WWW-Authenticate: Bearer resource_metadata="<its own PRM>"`.
-* `GET /.well-known/oauth-protected-resource` → its **own PRM** (§6.1).
+* Unauthenticated `GET /vo/resource` (or any URL below `RS_SERVICE_PATH`, with or without a
+  query: `/vo/tap/async/<id>`, `/vo/datalink?ID=…`) → `401` with
+  `WWW-Authenticate: Bearer resource_metadata="<the PRM URL for THAT request>"`.
+* `GET /.well-known/oauth-protected-resource/<path>[?<query>]` → the **PRM generated for
+  that URL** (§6.1); `404` outside the service path.
 * With a Bearer token it verifies, before returning anything: signature against
   the IAM JWKS, `iss == IAM`, scope contains **`vo.read`**, not expired, and — if
-  the token carries an `aud` — that it **includes the resource's own id**.
+  the token carries an `aud` — that it **includes an identifier from `RS_AUDIENCE_IDS`
+  that covers the request URL** (so a domain-wide token naming several entries is accepted
+  while a token for an unrelated service is not).
 * Valid → `200` with the payload (`protected_resource.txt`).
 * Missing scope → `403 insufficient_scope`; bad/expired/wrong-aud → `401`.
-* With `RS_TEST_FAULTS=1` (on for the harness's `src` instance) it also serves two
-  deliberately broken discovery set-ups used by the negative scenarios:
-  `/faults/prm-not-covering/vo-resource` (its PRM describes a different resource)
-  and `/faults/prm-redirect/vo-resource` (its PRM URL redirects to a good PRM).
+* With `RS_TEST_FAULTS=1` (on for the harness's `src` instance) it also serves three
+  deliberately broken discovery set-ups used by the negative scenarios, under the service path:
+  `/vo/faults/prm-not-covering/resource` (its PRM describes a different resource),
+  `/vo/faults/prm-covering/resource` (its PRM names the service identifier, which *covers* the
+  URL but is not equal to it — what the pre-review profile accepted) and
+  `/vo/faults/prm-redirect/resource` (its PRM URL redirects to a good PRM).
 
-The validation logic is covered by `tests/test_fake_rs.py`: the six cases — valid,
-wrong audience, missing scope, rogue issuer, expired, unauthenticated — plus the
-PRM endpoint, `aud` present/absent, and the fixtures.
+The validation logic is covered by `tests/test_fake_rs.py`: the six token cases — valid,
+wrong audience, missing scope, rogue issuer, expired, unauthenticated — plus `aud` present/absent
+and with several entries, the PRM for a path and for a query (including characters that need JSON
+escaping and byte-exact percent-encoding), the `404` outside the service path, the pointer derived
+from the requested URL, and the fixtures.
 
 Two harness fixes worth noting:
 
@@ -572,7 +692,7 @@ Run any of them from `test-integration/demo/`:
 
 ```bash
 # Reference driver — you complete the device login in a browser.
-python demo.py --resource https://src.local.io/vo-resource \
+python demo.py --resource https://src.local.io/vo/resource \
   --cacert ../certs/local-ca.pem --client-id-file ../seed/client_id
 
 # Non-interactive — auto-approves the device login as the given user.
@@ -586,7 +706,10 @@ python human_demo.py
 java HumanDemo.java
 ```
 
-Add `--token-exchange` to `demo.py`/`auto_demo.py` to also run RFC 8693 exchange.
+Add `--token-exchange` to `demo.py`/`auto_demo.py` to also run RFC 8693 exchange, and
+`--audience domain` to any driver to request every entry of the IAM's `protected_resources`
+instead of only the one covering the URL. `human_demo.py` / `HumanDemo.java` explain, in plain
+words, why the PRM must name the exact URL and why the audience comes from the IAM's list.
 On success the resource returns the protected payload (an ASCII galaxy here).
 
 ### The reference clients
@@ -594,7 +717,7 @@ On success the resource returns the protected payload (an ASCII galaxy here).
 ```bash
 export REQUESTS_CA_BUNDLE=test-integration/certs/local-ca.pem
 AUTHVO_CLIENT_ID=$(cat test-integration/seed/client_id) \
-  python authvo_client.py https://src.local.io/vo-resource
+  python authvo_client.py https://src.local.io/vo/resource
 
 # Java: needs Jackson (core, annotations, databind) on the classpath, see pom.xml.
 javac -d out -cp "$JACKSON" AuthVoClient.java
@@ -602,11 +725,13 @@ keytool -importcert -noprompt -alias authvo-local -file test-integration/certs/l
   -keystore ca.jks -storepass changeit
 AUTHVO_CLIENT_ID=$(cat test-integration/seed/client_id) \
   java -Djavax.net.ssl.trustStore=ca.jks -Djavax.net.ssl.trustStorePassword=changeit \
-       -cp "out:$JACKSON" org.ivoa.authvo.AuthVoClient https://src.local.io/vo-resource
+       -cp "out:$JACKSON" org.ivoa.authvo.AuthVoClient https://src.local.io/vo/resource
 ```
 
 Both exit `0` only if the resource returns `200`, `1` on a failed check / network
-error / any other status. Set `AUTHVO_TOKEN_EXCHANGE=1` to also exchange the token.
+error / any other status. Set `AUTHVO_TOKEN_EXCHANGE=1` to also exchange the token, and
+`AUTHVO_AUDIENCE=domain` (default `covering`) to request every `protected_resources` entry
+(an unknown value is a usage error, exit `2`).
 
 ### Tests
 
@@ -632,13 +757,16 @@ python test-integration/tests/run_scenarios.py --java-cp "$JACKSON"
 
 | # | Scenario | Expected |
 |---|----------|----------|
-| 0 | preflight | the stack serves the PRM, the augmented metadata, no PRM sidecar |
-| 1 | happy path (1: preconfigured client, 1b: dynamic registration, 1c: with the optional token exchange on), Python and Java | protected payload returned (1c: the exchanged token carries `aud`) |
+| 0 | preflight | a PRM generated per request (also for a query, byte for byte), `404` outside the service, the augmented metadata with both entries, no PRM sidecar |
+| 1 | happy path (1: preconfigured client, 1b: dynamic registration, 1c: with the optional token exchange on), Python and Java | protected payload returned (1c: the exchanged token carries `aud=https://src.local.io/vo`) |
 | 2 | evil resource server (`evil.local.io`) | abort at the resource check, before any login |
 | 3 | `protected_resources` removed from the augmenter config | abort at the resource check |
-| 4 | PRM `resource` does not cover the requested URL | abort at step 2 |
+| 4 | PRM `resource` is a different resource | abort at step 2 |
 | 5 | the PRM URL redirects | abort — redirects are never followed |
-| 6 | resource server's token-validation cases | unit tests pass |
+| 6 | resource server's token-validation, PRM and routing cases | unit tests pass |
+| 7 | variable paths: `/vo/tap/async/<random>` and a URL with a query | a PRM is generated for each, step 2 (exact match) passes, the token is requested for `https://src.local.io/vo` only (never the URL or its query) |
+| 8 | PRM whose `resource` **covers** the requested URL but is not equal to it (`/vo/faults/prm-covering/resource`) | abort at step 2, before any login |
+| 9 | `AUTHVO_AUDIENCE=domain` | **a measurement, not pass/fail**: what the IAM issues for several `resource` parameters, in different orders, with an unlisted value, with a query, and (to measure only) one space-separated value (§7.4). The IAM version is printed from the running container |
 
 Every abort scenario also asserts the client stopped **before** registration and
 the device grant. If `evil.local.io` is not in `/etc/hosts` the runner maps it for
@@ -654,7 +782,7 @@ the client processes only.
 | IAM exits: H2 syntax error on `token_value(767)` | Datasource fell back to H2 — set the `SPRING_DATASOURCE_*` properties. |
 | IAM exits: *Key Set resource could not be read: keystore.jwks* | No signing keystore — generate one (§7.2) and set `IAM_KEY_STORE_LOCATION`. |
 | Client aborts: *check (b): the issuer publishes no protected_resources* | The augmenter isn't answering the metadata paths (Traefik hasn't registered it — retry or restart the proxy) or its config is empty. Check `curl --cacert test-integration/certs/local-ca.pem https://iam.local.io/.well-known/oauth-authorization-server \| jq .protected_resources` (§6.2). |
-| Client aborts: *STEP 2 FAILED … does not cover the requested URL* | The PRM's `resource` (`RS_RESOURCE_ID`) doesn't cover the URL you asked for (§2). |
+| Client aborts: *STEP 2 FAILED … is not identical to the requested URL* | The PRM's `resource` is not exactly the URL you asked for, query included (§2, RFC 9728 §3.3). A static PRM, or one for the service identifier, cannot pass: the server must generate the PRM per request (§6.1). |
 | Client aborts: *refusing to follow redirects* | A discovery URL answered 3xx. Clients never follow redirects; fix the URL (the PRM pointer, the issuer in the PRM). |
 | Client aborts: *check (a): metadata issuer … != the issuer named by the PRM* | `RS_ISSUER` and the IAM's `IAM_ISSUER` differ (mind the trailing slash). |
 | Clients abort with *the issuer publishes no protected_resources* although `augmenter/config/protected_resources.json` has content, and `docker exec <augmenter> ls /config` shows nothing | A **stale directory bind mount**: the host directory was deleted and re-created while the stack was up (typically by `git checkout` to a commit without `augmenter/`, or `git clean`), and the container still points at the old, deleted one. `docker compose up -d --force-recreate augmenter`. |
@@ -705,7 +833,7 @@ from the authorization server's own `protected_resources` metadata member.
 | 2 401 → sidecar pointer | **1** — the pointer is extracted as part of the probe (still untrusted) |
 | 3 GET the sidecar **at the IAM** | **2** GET the PRM published by the **resource server** (HTTPS, no redirects) |
 | 4(a) domain-proxy gate (a): sidecar origin == issuer origin | **removed.** Replaced by check (a) of step 3: the issuer's RFC 8414 metadata names the issuer the PRM named |
-| 4(b) gate (b): the resource is in the **sidecar's** list | split in two: **2** the PRM `resource` covers the URL, and **3(b)** the **issuer's** `protected_resources` covers it (reading `protected_resources` from the PRM is gone) |
+| 4(b) gate (b): the resource is in the **sidecar's** list | split in two: **2** the PRM `resource` covers the URL (*since tightened to an exact match, see below*), and **3(b)** the **issuer's** `protected_resources` covers it (reading `protected_resources` from the PRM is gone) |
 | 5 GET AS metadata (RFC 8414, then OIDC) | merged into **3**: the RFC 8414 document is where the check is made; OIDC discovery only reads missing endpoints, never skips (b) |
 | 6 dynamic registration | **4** — unchanged (asks for the token-exchange grant only if exchange is on) |
 | 7 device authorization, 8 prompt the user, 9 poll the token endpoint | **5** — now sends `resource=<matched id>` (RFC 8707) and shows the resource *and* the issuer; no INDIGO `aud` parameter |
@@ -728,6 +856,28 @@ fetch is merged into it), `_step3_fetch_sidecar` → `_step2_prm`; the same in
 | — | **evil** resource server on `evil.local.io` + negative scenarios; `evil.local.io` in the cert SANs and `/etc/hosts` |
 | — | offline tests and the live scenario runner (`test-integration/tests/`) |
 
+### Changes after the PR #23 review
+
+The AuthVO draft changed again after the review of
+[ivoa-std/AuthVO PR #23](https://github.com/ivoa-std/AuthVO/pull/23) (third commit on branch
+`issue22-rfc9728`, "apply the PR #23 review"): the profile now follows RFC 9728 more strictly.
+
+| Before | After |
+|--------|-------|
+| Step 2: the PRM `resource` must **cover** the requested URL | Step 2: the PRM `resource` must be **identical** to the requested URL, query included (RFC 9728 §3.3). The relaxation is gone; `urls_match_exactly` (Python) / `urlsMatchExactly` (Java) |
+| Coverage used for the PRM *and* for `protected_resources` | Coverage (`is_covered`, `most_specific_cover`) applies **only** to the `protected_resources` entries, and ignores any query of the requested URL. The entries plus the URLs they cover form the *authentication domain* |
+| One static PRM per service, at a fixed well-known URL | **Generated per request** by one handler for `/.well-known/oauth-protected-resource/<path>`: same members every time, `resource` = the URL asked about, query included. `RS_SERVICE_PATH` bounds what it answers for (`404` outside); `RS_PRM_URL` is gone; the 401 pointer is derived from the requested URL |
+| The token was requested for the identifier that matched in 3(b), on the token request only | The audience comes from `protected_resources` and **never from the PRM `resource`**: the covering entry by default, **every** entry with `audience="domain"` / `AUTHVO_AUDIENCE=domain`. `resource` goes on the device authorization request **and** the token request, repeated per entry (RFC 8707 §2); the optional exchange uses the same list |
+| The prompt showed the resource and one "token is for" id | It shows the requested URL, the issuer and every audience entry |
+| `fake-rs` accepted `aud` naming its one id | A present `aud` must include an identifier from `RS_AUDIENCE_IDS` **that covers the request** |
+| Protected URL `/vo-resource`; faults at `/faults/<name>/vo-resource` | `/vo/resource` (it has to sit below the service path); faults at `/vo/faults/<name>/resource`, plus `prm-covering` |
+| `protected_resources` = `["https://src.local.io"]` | `["https://src.local.io/vo", "https://src.local.io/datalink"]`; the second entry is listed but not served |
+| Scenarios 1–6 | 1–6 adapted; **7** variable paths and a query, **8** a covering-but-not-equal PRM aborts at step 2, **9** a measurement of `AUTHVO_AUDIENCE=domain` |
+
+Unchanged: the Step 3 checks (`issuer` match, mandatory `protected_resources`, abort before any
+login), no redirects on either metadata fetch, `aud` checked by the resource server only when
+present, the augmenter, and the evil-service test. The IAM was not modified.
+
 ---
 
 ## 14. Operating it for real: publishing `protected_resources` on your IAM
@@ -738,12 +888,13 @@ your own IAM**: what you have to put in place, in what order, and how to check i
 ### 14.0 What this does — and does not — change
 
 **INDIGO IAM itself is not modified, and cannot be configured to do this.** We checked
-the pinned release (v1.10.0) directly: its discovery document
+the release pinned when this was first checked (v1.10.0) directly: its discovery document
 (`/.well-known/openid-configuration`, 34 members) has no `protected_resources`; it
 serves no RFC 8414 document at `/.well-known/oauth-authorization-server` (404); and the
 string `protected_resources` appears nowhere in the IAM's own compiled code (its 970 classes
 and two `iam-*` jars; a search for a member it does publish, `device_authorization_endpoint`,
-does find it). So the member is added **on
+does find it). On **v1.15.0**, the pinned release, the same holds as far as it was checked live: the OIDC discovery
+document has no `protected_resources` and the RFC 8414 URL answers `404` (the class search was not repeated). So the member is added **on
 the way out** by a small reverse proxy — the *augmenter* (`test-integration/augmenter/`)
 — that sits in front of exactly those two documents:
 
@@ -771,12 +922,16 @@ restrict who can change it, and review changes.
 
 ### 14.2 Step by step
 
-**1. Decide the identifiers.** One per protected service, normally its origin or a path
-prefix, written exactly as that service publishes it as the `resource` of its own PRM
+**1. Decide the identifiers.** One per protected service, normally the path prefix the service
+owns (`https://data.example.org/tap`), written exactly as that service publishes it as the `resource` of its own PRM
 (§6.1). A request URL is *covered* by an identifier if it is equal to it or extends it at a
-path-segment boundary (§2), so `https://data.example.org` covers every URL on that
+path-segment boundary, ignoring its query (§2), so `https://data.example.org` covers every URL on that
 service, whereas `https://data.example.org/tap` covers `/tap/async/1` but not `/tapx`.
-Prefer service-level identifiers over deep URLs.
+Prefer service-level identifiers over deep URLs. **On a host shared by several services or projects,
+do not list an identifier that covers the whole host** (`https://data.example.org`): it would let one
+tenant's token be presented to another tenant's services (the draft's note on serving the PRM). You list **one identifier per service**,
+not one per URL: the resource server generates its PRM per request (§6.1), so its `resource`
+is the requested URL and never needs registering.
 
 **2. Put them in the augmenter's config file** (`protected_resources.json`):
 
@@ -834,10 +989,12 @@ server {
 ```
 
 **5. Make each resource server consistent with the list.** Its PRM (§6.1) must say
-`resource` = one of the identifiers you listed (or one that is covered by an entry) and
+`resource` = **the URL that was requested**, exactly (generated per request; §6.1), that
+URL must be covered by one of the identifiers you listed, and
 `authorization_servers` = your issuer **exactly as the IAM writes it** (mind the trailing
 slash: `https://iam.example.org/` is not `https://iam.example.org`), and its 401 challenge
-must point at that PRM. It checks `iss`, scope, expiry and — when present — `aud`.
+must point at the PRM for that request. It checks `iss`, scope, expiry and — when present — `aud`,
+which must include an identifier that covers the request.
 
 **6. Verify**, from outside, with nothing but `curl` and `jq`:
 
@@ -902,7 +1059,8 @@ delete the augmenter service and the two routes; no client or resource server ch
 
 This section records where the reference clients and the harness follow the standards,
 where they depart from them **on purpose** (the AuthVO profile), and how they stand against
-the draft. It was checked against the text of the AuthVO working draft with the issue #22
+the draft. After the review of AuthVO PR #23 the profile has **no departure from RFC 9728 §3.3**
+any more (§13). It was checked against the text of the AuthVO working draft with the issue #22
 changes (*Authentication in the Virtual Observatory*, IVOA Working Draft 2025-05-27, revision
 `eb70373-dirty`, 2026-10-09) and, for RFC 9728, RFC 8707 and RFC 9068, against the RFC texts.
 The other RFCs below are as implemented and were **not** re-read for this review.
@@ -911,37 +1069,43 @@ The other RFCs below are as implemented and were **not** re-read for this review
 
 | Standard | What | Where |
 |----------|------|-------|
-| RFC 9728 §2, §3.1, §3.2 | PRM members (`resource`, `authorization_servers`, `scopes_supported`, `bearer_methods_supported`); well-known URL with the suffix inserted between host and path; `200` JSON | `fake-rs`; `test_fake_rs.py` |
+| RFC 9728 §2, §3.1, §3.2 | PRM members (`resource`, `authorization_servers`, `scopes_supported`, `bearer_methods_supported`); well-known URL with the suffix inserted between host and path and the query kept at the end; `200` JSON; **generated per request** | `fake-rs`; `test_fake_rs.py`; scenarios 0, 7 |
+| RFC 9728 §3.3 | when the PRM URL came from the `WWW-Authenticate` pointer, `resource` must be **identical** to the requested URL, query included, else the PRM is not used | both clients (`urls_match_exactly`); shared `exact` vectors; scenarios 4, 8 |
 | RFC 9728 §5.1 | `WWW-Authenticate: Bearer resource_metadata="…"` in the `401` | `fake-rs`, both clients |
 | RFC 9728 §4 | `protected_resources` as an authorization-server metadata member (as *defined*; see 15.2 for its status) | augmenter |
 | RFC 8414 §3.1, §3.3 | metadata URL construction (issuer with or without a path); `issuer` identical to the one named | both clients (check (a)) |
-| RFC 8707 §2, §2.2 | `resource` on the token request (§2.2: all grant types); the most specific identifier | both clients |
+| RFC 8707 §2, §2.2 | `resource` on the device authorization request **and** the token request (§2.2: all grant types), **repeated** for several entries; an absolute URI without a fragment (invalid `protected_resources` entries are skipped, or abort if the covering one) | both clients; scenarios 1, 9 |
 | RFC 6750 | no error code when no token is sent; `invalid_token` for a bad one; `403 insufficient_scope` | `fake-rs` |
 | RFC 8628, RFC 7591, RFC 8693 | device grant (polling, `authorization_pending`, `slow_down`); dynamic registration of a public client; optional exchange | both clients |
 
 ### 15.2 Deliberate departures from the RFCs (the AuthVO profile)
 
-These are choices of the AuthVO draft (§3.3.1, §5.4), not accidents. Each has a consequence.
+These are choices of the AuthVO draft (§3.3.1, §5.4), not accidents. Each has a consequence. (The earlier
+first row — a PRM `resource` that merely *covers* the URL, a relaxation of RFC 9728 §3.3 — was
+removed after the PR #23 review: Step 2 is now the exact match, so a generic RFC 9728 client accepts these
+PRMs, and the service generates them per request.)
 
 | # | RFC | AuthVO profile (and these clients) | Consequence |
 |---|-----|------------------------------------|-------------|
-| 1 | **RFC 9728 §3.3**: the PRM `resource` must be *identical* to the identifier the metadata URL was built from, and, for a URL taken from a challenge, must match the URL the client requested; otherwise the data must not be used | the PRM `resource` must **cover** the requested URL (same origin, path equal or extending it at a segment boundary), so one identifier governs a service with variable paths (draft §3.3.1: "relaxes the exact match") | **A client that follows RFC 9728 to the letter would reject this PRM for a deep URL.** Interoperability with generic RFC 9728 clients needs the profile |
-| 2 | **RFC 9728 §4**: `protected_resources` is *optional*, and the RFC does not say how a client uses it | **mandatory**; an absent list is a failure (draft §3.3.1, §5.4.3) | Issuers that do not publish it (INDIGO 1.10) need the augmenter, or clients refuse them |
-| 3 | RFCs silent on redirects | no redirect is followed on any discovery request, the token endpoint, or the bearer request (the draft requires it for the PRM and the AS metadata) | stricter than the draft |
-| 4 | **RFC 9068 §4**: a resource server must reject a JWT whose `aud` does not include itself (RFC 8707 §2: the AS should audience-restrict) | the resource server checks `aud` **only when present** (draft §5.4.6) | INDIGO 1.10 issues tokens **without `aud`**, so a leaked token is replayable at any resource the issuer lists, unless the optional token exchange is used (§7.4) |
-| 5 | RFC 9068 §2.1/§4: `typ` header `at+jwt` | not checked | INDIGO 1.10's access tokens carry no `typ` (observed) |
+| 1 | **RFC 9728 §4**: `protected_resources` is *optional*, and the RFC does not say how a client uses it | **mandatory**; an absent list is a failure (draft §3.3.1, §5.4.3); a URL is *covered* by an entry if it is equal or extends it at a path-segment boundary, ignoring the query (the authentication domain) — a rule the RFC does not define | Issuers that do not publish it (INDIGO 1.10 and 1.15) need the augmenter, or clients refuse them |
+| 2 | RFCs silent on redirects | no redirect is followed on any discovery request, the token endpoint, or the bearer request (the draft requires it for the PRM and the AS metadata) | stricter than the draft |
+| 3 | **RFC 9068 §4**: a resource server must reject a JWT whose `aud` does not include itself (RFC 8707 §2: the AS should audience-restrict) | the resource server checks `aud` **only when present** (draft §5.4.6) | INDIGO 1.10 issues tokens **without `aud`**, so a leaked token is replayable at any resource the issuer lists, unless the optional token exchange is used; INDIGO 1.15 sets `aud` from `resource` (§7.4) |
+| 4 | RFC 9068 §2.1/§4: `typ` header `at+jwt` | not checked | INDIGO 1.10's and 1.15's access tokens carry no `typ` header (observed) |
 
 ### 15.3 The implementation against the draft
 
 | Draft requirement | Status |
 |-------------------|--------|
-| §5.4.1–5.4.3: HTTPS; pointer untrusted; PRM `resource` covers the URL, else abort; AS metadata (RFC 8414) without redirects; (a) `issuer` equal, (b) `protected_resources` present and covering, else abort **before any login**; the RFC 8414 document is the one used; first passing issuer wins | ✅ both clients; every abort path tested, live (scenarios 2–5) |
+| §5.4.1–5.4.3: HTTPS; pointer untrusted; PRM `resource` **identical** to the requested URL, else abort; AS metadata (RFC 8414) without redirects; (a) `issuer` equal, (b) `protected_resources` present and covering, else abort **before any login**; the RFC 8414 document is the one used; first passing issuer wins | ✅ both clients; every abort path tested, live (scenarios 2–5, 8) |
 | §5.4.4: dynamic registration as a public client; grant types limited to the device grant | ✅ |
-| §5.4.5: show the resource **and** the issuer; `resource` on the token request; **verify an access token is present and of type Bearer** | ✅ — the `token_type` check was **missing** and was added with this section (case-insensitive, RFC 6749 §7.1), with tests in both languages |
+| §5.4.5: show the resource **and** the issuer; `resource` on the device authorization **and** token requests, **taken from `protected_resources`, never from the PRM**, at least the covering entry (optionally every entry); **verify an access token is present and of type Bearer** | ✅ — the `token_type` check was **missing** and was added with this section (case-insensitive, RFC 6749 §7.1), with tests in both languages |
 | §5.4.6: the resource server validates signature, `iss`, scope, expiry, and `aud` when present | ✅ `fake-rs` |
 | §5.4.7: refresh, re-sending the same `resource` | ⛔ not implemented (a MAY); the clients also do not request `offline_access` |
 | §5.4.3: if an authorization *response* carries an issuer (RFC 9207), it must match | ➖ not applicable: the device grant has no authorization response. The clients' `iss` check is a sanity check on the token's own claim (RFC 7519 §4.1.1), not RFC 9207 |
 | §3.3.1: the AS **publishes** `protected_resources` (also in the OIDC document, as a SHOULD) | ✅ via the augmenter, which adds it to both documents |
-| §3.3.1: the AS **SHOULD reject** a `resource` it does not list (RFC 8707 `invalid_target`) | ❌ INDIGO 1.10 does not: it issued the same token for a listed, an unlisted and an absent `resource` (checked) |
-| §3.3.1: the AS **SHOULD restrict the audience** to the requested resource | ❌ INDIGO 1.10 issues no `aud`; ✅ with the optional token exchange |
-| §3.3.1 note: the proxy "retrieves the server's live RFC 8414 metadata" | ➕ INDIGO 1.10 serves **no** RFC 8414 document (`404`); the augmenter derives one from its OIDC document (§6.2) |
+| §3.3.1: the AS **SHOULD reject** a `resource` it does not list (RFC 8707 `invalid_target`) | ❌ INDIGO 1.10 does not: it issued the same token for a listed, an unlisted and an absent `resource` (checked). ❌ INDIGO 1.15.0 does not either: it issued a token with `aud` = the unlisted value (checked) |
+| §3.3.1: the AS **SHOULD restrict the audience** to the requested resource | ❌ INDIGO 1.10 issues no `aud`; ✅ INDIGO 1.15.0 sets `aud` from `resource` (first value only); ✅ with the optional token exchange |
+| §5.4.5 / RFC 8707 §2: a domain-wide token by repeating `resource` | ✅ clients (`audience="domain"`); ➖ **measured** (§7.4, scenario 9): INDIGO **1.10.0** accepts and ignores the repeated values (no `aud`); INDIGO **1.15.0** honours `resource` but takes only the **first** repeated value, so it does not issue a domain-wide token (a single space-separated value does, which RFC 8707 does not define) |
+| §3.3.1: the AS rejects a `resource` with a query (RFC 8707 §2 discourages it) | ✔ observed on INDIGO 1.15.0 (`invalid_target` at the consent page); 1.10.0 ignores it. Reason the audience never comes from the PRM `resource` |
+| RFC 9728 §3.3 / the draft: the service answers for variable paths | ✅ `fake-rs` generates the PRM per request, `404` outside its service path |
+| §3.3.1 note: the proxy "retrieves the server's live RFC 8414 metadata" | ➕ INDIGO 1.10 and 1.15 serve **no** RFC 8414 document (`404`; checked live); the augmenter derives one from its OIDC document (§6.2) |

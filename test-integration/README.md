@@ -35,7 +35,7 @@ echo "127.0.0.1  iam.local.io src.local.io evil.local.io" | sudo tee -a /etc/hos
 ./setup.sh           # certs (leaf re-issued if it lacks a name), keystore, up, provision
 
 python demo/demo.py \
-  --resource https://src.local.io/vo-resource \
+  --resource https://src.local.io/vo/resource \
   --cacert  certs/local-ca.pem \
   --client-id-file seed/client_id
 ```
@@ -54,7 +54,7 @@ python tests/run_scenarios.py --java-cp "$JACKSON"      # real clients vs. the l
 
 ```bash
 java demo/Demo.java \
-  --resource https://src.local.io/vo-resource \
+  --resource https://src.local.io/vo/resource \
   --cacert   certs/local-ca.pem \
   --client-id-file seed/client_id
 ```
@@ -77,18 +77,23 @@ argument. See the top-level README §1–§2 and §13.
 
 ## The protected REST service (`fake-rs/app.py`)
 
-- Unauthenticated `GET /vo-resource` (or a dynamic `GET /datalink/download/...`
-  deep link) → `401` with `WWW-Authenticate: Bearer resource_metadata="<its PRM>"`.
-- `GET /.well-known/oauth-protected-resource` → its PRM, built from its
-  environment (`RS_RESOURCE_ID`, `RS_ISSUER`, `RS_REQUIRED_SCOPE`).
+- Unauthenticated `GET /vo/resource` (or any URL under `RS_SERVICE_PATH`, query included,
+  e.g. `/vo/tap/async/<id>`) → `401` with
+  `WWW-Authenticate: Bearer resource_metadata="<the PRM URL for that request>"`.
+- `GET /.well-known/oauth-protected-resource/<path>[?<query>]` → the PRM **generated for that
+  URL** (`resource` = the URL asked about, query included; RFC 9728 §3.1/§3.3), built from the
+  environment (`RS_RESOURCE_ID`, `RS_SERVICE_PATH`, `RS_ISSUER`, `RS_REQUIRED_SCOPE`); `404`
+  outside the service path.
 - With a Bearer token it checks, before returning anything: signature against the
   IAM JWKS, `iss` == IAM, scope contains **`vo.read`**, not expired, and — **if
-  the token carries an `aud`** — that it includes its own resource id.
+  the token carries an `aud`** — that it includes an identifier from `RS_AUDIENCE_IDS`
+  that covers the request.
 - Valid → `200` with the ASCII body. Missing scope → `403 insufficient_scope`.
   Bad/expired/wrong-aud → `401`.
 
 The validation is covered by `tests/test_fake_rs.py` (valid, wrong aud, missing
-scope, rogue issuer, expired, unauthenticated; plus the PRM and `aud` present/absent).
+scope, rogue issuer, expired, unauthenticated; plus the per-request PRM, the 404 outside the
+service path, and `aud` present/absent/with several entries).
 
 ## INDIGO IAM caveats (worth reading before you commit)
 
@@ -99,10 +104,11 @@ scope, rogue issuer, expired, unauthenticated; plus the PRM and `aud` present/ab
   so the IAM must issue JWT access tokens (mount a signing keystore).
 - **A login user** must exist for the device grant (`provision.sh` creates one).
 - **`protected_resources` is not published by INDIGO today**, hence the augmenter.
-  Resource indicators (RFC 8707) are not honoured either: v1.10.0 accepts the
-  `resource` parameter the clients send but ignores it, so the token has no `aud`
-  (the resource server checks `aud` only when the token carries one). The optional
-  token exchange is what yields an `aud`-bound token.
+  Resource indicators (RFC 8707) depend on the release: v1.10.0 accepted the
+  `resource` parameter the clients send but ignored it (no `aud`); the pinned **v1.15.0** sets
+  `aud` from it, but only from the *first* of several repeated values (top-level README §7.4).
+  The resource server checks `aud` only when the token carries one, and the optional
+  token exchange also yields an `aud`-bound token.
 - Token exchange (RFC 8693) is optional and off by default; a self-registered
   client can't use it on INDIGO (see the top-level README §7.4).
 

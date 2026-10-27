@@ -1,5 +1,6 @@
 {
   "protected_resources": [
-    "https://src.local.io"
+    "https://src.local.io/vo",
+    "https://src.local.io/datalink"
   ]
 }

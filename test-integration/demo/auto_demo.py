@@ -2,7 +2,8 @@
 """
 Non-interactive AuthVO demo driver.
 
-Identical flow to demo.py (probe -> PRM -> resource check -> device grant), but it
+Identical flow to demo.py (probe -> PRM (exact match) -> resource check -> device grant
+with the audience from the issuer's protected_resources), but it
 also performs the human step automatically: it logs the configured IAM user in and
 approves the device authorization request, so the demo runs end to end with no
 browser.
@@ -13,7 +14,7 @@ ask the issuer's own RFC 8414 metadata whether it really serves this resource (i
 `issuer` must match and `protected_resources` must list the resource). An absent
 list aborts. See authvo_checks.py.
 
-  python auto_demo.py --resource https://src.local.io/vo-resource \
+  python auto_demo.py --resource https://src.local.io/vo/resource \
       --cacert ../certs/local-ca.pem --client-id-file ../seed/client_id \
       --username vouser --password vouser
 """
@@ -51,12 +52,16 @@ def auto_approve(s, issuer, user, pw, user_code):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--resource", default="https://src.local.io/vo-resource")
+    ap.add_argument("--resource", default="https://src.local.io/vo/resource")
     ap.add_argument("--cacert", default="../certs/local-ca.pem")
     ap.add_argument("--client-id-file", default="../seed/client_id")
     ap.add_argument("--scope", default="vo.read")
     ap.add_argument("--username", default="vouser")
     ap.add_argument("--password", default="vouser")
+    ap.add_argument("--audience", choices=(chk.AUDIENCE_COVERING, chk.AUDIENCE_DOMAIN),
+                    default=chk.AUDIENCE_COVERING,
+                    help="covering: request the ONE protected_resources entry covering the URL "
+                         "(default); domain: request EVERY entry (a domain-wide token)")
     ap.add_argument("--token-exchange", action="store_true",
                     help="also narrow the token with RFC 8693 token exchange (off by default)")
     args = ap.parse_args()
@@ -74,15 +79,16 @@ def main():
         chk.require_https(pointer, "PRM pointer")
         print(f"[1] 401 -> PRM pointer (untrusted): {pointer}")
 
-        # 2. The resource server's own PRM must cover the URL we asked for.
+        # 2. The resource server's own PRM must be IDENTICAL to the URL we asked for.
         prm = chk.get_json(s, pointer, "Protected Resource Metadata")
         issuers = chk.check_prm(args.resource, prm)
         print(f"[2] PRM: resource={prm['resource']} authorization_servers={issuers}; "
-              "it covers the requested URL")
+              "identical to the requested URL")
 
         # 3. RESOURCE CHECK, on the issuer's own RFC 8414 metadata.
         issuer, as_doc, resource_id, oidc_url = chk.resource_check(s, args.resource, issuers)
         print(f"[3] resource check PASSED: {issuer} vouches for {resource_id}")
+        audience = chk.audience_entries(as_doc, resource_id, args.audience)
         ep = chk.endpoints(s, as_doc, issuer, oidc_url,
                            "device_authorization_endpoint", "token_endpoint")
 
@@ -91,8 +97,10 @@ def main():
         print(f"[4] client_id={client_id}")
 
         # 5. Device authorization grant.
+        # RFC 8707: `resource` (the ISSUER's entries, not the PRM's) on this request ...
         da = s.post(ep["device_authorization_endpoint"],
-                    data={"client_id": client_id, "scope": f"openid {args.scope}"},
+                    data=[("client_id", client_id), ("scope", f"openid {args.scope}")]
+                    + chk.resource_params(audience),
                     allow_redirects=False).json()
         print(f"[5] device authorization: user_code={da['user_code']}")
 
@@ -101,14 +109,14 @@ def main():
         approver.verify = args.cacert
         auto_approve(approver, issuer, args.username, args.password, da["user_code"])
 
-        # 5c. Poll for the token, bound to the matched resource (RFC 8707).
+        # 5c. ... and on the token request: poll for a token for the same audience.
         interval = da.get("interval", 5)
         token = None
         deadline = time.time() + da.get("expires_in", 600)
         while time.time() < deadline:
-            tr = s.post(ep["token_endpoint"], data={
-                "grant_type": DEVICE_GRANT, "device_code": da["device_code"],
-                "client_id": client_id, "resource": resource_id},
+            tr = s.post(ep["token_endpoint"], data=[
+                ("grant_type", DEVICE_GRANT), ("device_code", da["device_code"]),
+                ("client_id", client_id)] + chk.resource_params(audience),
                 allow_redirects=False)
             body = tr.json()
             if tr.status_code == 200:
@@ -121,16 +129,16 @@ def main():
         if not token:
             print("[5] timed out waiting for authorization")
             return 3
-        print(f"[5] got access token (resource={resource_id}; "
+        print(f"[5] got access token (resource={audience}; "
               f"aud={chk.aud_of(token) or '<absent/opaque>'}, informational)")
 
         if args.token_exchange:
-            xr = s.post(ep["token_endpoint"], data={
-                "grant_type": TOKEN_EXCHANGE, "client_id": client_id,
-                "subject_token": token,
-                "subject_token_type": "urn:ietf:params:oauth:token-type:access_token",
-                "audience": resource_id, "resource": resource_id, "scope": args.scope},
-                allow_redirects=False)
+            xr = s.post(ep["token_endpoint"], data=[
+                ("grant_type", TOKEN_EXCHANGE), ("client_id", client_id),
+                ("subject_token", token),
+                ("subject_token_type", "urn:ietf:params:oauth:token-type:access_token")]
+                + [("audience", a) for a in audience] + chk.resource_params(audience)
+                + [("scope", args.scope)], allow_redirects=False)
             if xr.status_code != 200:
                 print("[5d] token exchange failed:", xr.status_code, xr.text)
                 return 4
