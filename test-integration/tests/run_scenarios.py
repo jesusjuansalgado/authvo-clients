@@ -427,7 +427,19 @@ def probe_token(resources, creds, cid):
     rp = [("resource", r) for r in resources]
     dev = s.post(meta["device_authorization_endpoint"],
                  data=[("client_id", cid), ("scope", "openid vo.read")] + rp).json()
-    approve_device(dev["user_code"], *creds)
+    if "user_code" not in dev:
+        return {"error": "device authorization refused", "detail": dev}
+    try:
+        approve_device(dev["user_code"], *creds)
+    except RuntimeError as e:
+        # e.g. INDIGO >= 1.12 refuses a resource with a query only when the user opens the consent
+        # page (`invalid_target`): the device authorization request itself is accepted.
+        v = requests.Session()
+        v.verify = str(CA)
+        v.get(IAM + "/login")
+        v.post(IAM + "/login", data={"username": creds[0], "password": creds[1]}, allow_redirects=False)
+        why = v.post(IAM + "/device/verify", data={"user_code": dev["user_code"]})
+        return {"error": "approval refused", "detail": why.text[:240], "approver": str(e)}
     deadline = time.time() + 120
     while time.time() < deadline:
         time.sleep(int(dev.get("interval", 5)))
@@ -445,9 +457,10 @@ def probe_token(resources, creds, cid):
 def iam_version():
     """The IAM image tag the stack runs (what the measurement applies to)."""
     try:
-        out = subprocess.run(["docker", "inspect", "--format", "{{.Config.Image}}", "test-integration-iam-1"],
-                             capture_output=True, text=True, timeout=20)
-        return out.stdout.strip() or "unknown"
+        # whichever compose project is up: find its `iam` service container by label
+        out = subprocess.run(["docker", "ps", "--filter", "label=com.docker.compose.service=iam",
+                              "--format", "{{.Image}}"], capture_output=True, text=True, timeout=20)
+        return out.stdout.strip().replace("\n", ", ") or "unknown"
     except Exception:
         return "unknown"
 
@@ -487,6 +500,24 @@ def s9_domain_audience(args, clients, creds, cid):
     stable = [{k: v for k, v in c.items() if k not in volatile} for _, d, c in rows if c]
     same = len(stable) == 3 and all(x == stable[0] for x in stable)
     any_aud = [c.get("aud") for _, d, c in rows if c]
+    # Extra, informational probes: ordering, an unlisted value, a query, and (only to MEASURE the
+    # IAM -- the clients never send it) one space-separated value, which is not RFC 8707.
+    print(f"\n{BOLD}more probes (what the IAM does with each shape of `resource`){RESET}")
+    extra = (("[service, datalink]  (the clients' order)", [SERVICE, DATALINK]),
+             ("[datalink, service]  (reversed)", [DATALINK, SERVICE]),
+             ("[service, datalink, unlisted]", [SERVICE, DATALINK, "https://other.example/x"]),
+             ("one UNLISTED value", ["https://other.example/x"]),
+             ("one value WITH a query", [RESOURCE_URL + "?ID=ivo%3A%2F%2Fx"]),
+             ("ONE space-separated value (not RFC 8707)", [SERVICE + " " + DATALINK]))
+    for label, res in extra:
+        doc = probe_token(res, creds, cid)
+        if "access_token" in doc:
+            aud = (jwt_claims(doc["access_token"]) or {}).get("aud", "<absent>")
+            line = f"aud={aud}"
+        else:
+            line = f"no token: {doc.get('error')} {doc.get('detail', '')}"
+        print(f"    {label:<44} -> {line}")
+        record("9", "iam-probe", None, f"{label} -> {line}")
     summary = (f"IAM {version}: claims identical (apart from jti/iat/exp) for none/one/two `resource` values: {same}; "
                f"aud per probe: {any_aud}")
     print(f"  {summary}")

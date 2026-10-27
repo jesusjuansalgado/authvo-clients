@@ -542,18 +542,37 @@ always checked.
 on it. (Earlier versions of `human_demo` used INDIGO's non-standard `aud` request
 parameter; that is gone — the clients send `resource` only.)
 
-> **Measured with INDIGO IAM v1.10.0 — several `resource` parameters** (scenario 9 in §10).
-> The clients, run with `AUTHVO_AUDIENCE=domain`, sent `resource=https://src.local.io/vo`
-> **and** `resource=https://src.local.io/datalink` on the device authorization request and on every
-> token poll. INDIGO accepted both requests and the flow completed. A direct probe of the same
-> user and client with **no** `resource`, **one**, and **two** produced access tokens whose
-> claims were identical apart from `jti`/`iat`/`exp` (`client_id`, `exp`, `iat`, `iss`, `jti`,
-> `scope`, `sub`), with **no `aud`** in any of them. So v1.10.0 ignores repeated `resource`
-> parameters exactly as it ignores a single one: there is no "first value only" to observe, because no
-> value is used. (From a reading of INDIGO's code — **not verified here** — newer releases are expected to take
-> only the *first* repeated value, as `@RequestParam Map<String,String>` does, and from 1.12 also to
-> split a single *space-separated* value. **That was not run**: the pinned IAM is v1.10.0 and the harness does not change it. The
-> clients do not send space-separated values.)
+> **Measured — several `resource` parameters** (scenario 9 in §10), on two INDIGO releases.
+> The clients, run with `AUTHVO_AUDIENCE=domain`, send `resource=https://src.local.io/vo` **and**
+> `resource=https://src.local.io/datalink` on the device authorization request and on every token
+> poll. Direct probes with the same user and client show what each IAM does with them:
+>
+> | `resource` sent | v1.10.0 | v1.15.0 |
+> |-----------------|---------|---------|
+> | none | no `aud` | no `aud` |
+> | one listed value | no `aud` (ignored) | `aud` = that value |
+> | `[service, datalink]` (the clients' order) | no `aud` | `aud` = **`service` only** |
+> | `[datalink, service]` (reversed) | no `aud` | `aud` = **`datalink` only** |
+> | `[service, datalink, unlisted]` | no `aud` | `aud` = `service` only |
+> | one value **not** in `protected_resources` | token issued, no `aud` | token issued, **`aud` = that unlisted value** (no `invalid_target`) |
+> | one value **with a query** | accepted, ignored | device authorization accepted, then the consent page fails with `invalid_target`: *"The resource indicator contains a query component"* — no token |
+> | **one space-separated value** `"service datalink"` (not RFC 8707; measured only, the clients never send it) | no `aud` | `aud` = **both**, as a list |
+>
+> So **v1.10.0 ignores `resource`**, repeated or not, and issues no `aud`. **v1.15.0 honours it but uses only the
+> *first* repeated value** (the order decides which), so `audience="domain"` does **not** yield a domain-wide token from
+> INDIGO 1.15: the covering entry is sent first, so the token is audience-restricted to the covering entry, as
+> with `audience="covering"`. Only a single space-separated value gave a multi-entry `aud`; that is not what RFC 8707
+> specifies and the clients do not send it (a client option for IAMs that need it would be a separate decision).
+> Two more facts from the same probes: v1.15.0 does **not** reject an unlisted resource (the draft's "SHOULD
+> `invalid_target`"; the Step 3 check stays the only protection), and it **does** reject a resource carrying a query,
+> which is why the audience must never be taken from the PRM `resource`. Releases between 1.10 and 1.15 were not tested.
+>
+> *To repeat this on another release* (the harness stays pinned to v1.10.0): run the stack as a separate
+> Compose project with an override that sets the `iam` image, e.g.
+> `COMPOSE_FILE=docker-compose.yml COMPOSE_PROJECT_NAME=iam115 docker compose -f docker-compose.yml -f override.yml up -d`,
+> then `./seed/provision.sh` and `python tests/run_scenarios.py --only 0,9`. For v1.15.0 the override also needs
+> `IAM_JAVA_OPTS: "-Dspring.profiles.active=mysql,registration,prod …"`: that release only creates the signing-keystore bean
+> under the `prod` profile. Provisioning and every scenario (0–9, both clients) ran unchanged against it: 22 of 22 verdicts passed.
 
 `DefaultClientRegistrationService` hard-codes
 `FORBIDDEN_GRANT_TYPES_FOR_ANONYMOUS` to include `token-exchange` and
@@ -736,7 +755,7 @@ python test-integration/tests/run_scenarios.py --java-cp "$JACKSON"
 | 6 | resource server's token-validation, PRM and routing cases | unit tests pass |
 | 7 | variable paths: `/vo/tap/async/<random>` and a URL with a query | a PRM is generated for each, step 2 (exact match) passes, the token is requested for `https://src.local.io/vo` only (never the URL or its query) |
 | 8 | PRM whose `resource` **covers** the requested URL but is not equal to it (`/vo/faults/prm-covering/resource`) | abort at step 2, before any login |
-| 9 | `AUTHVO_AUDIENCE=domain` | **a measurement, not pass/fail**: what the IAM issues for several `resource` parameters (§7.4) |
+| 9 | `AUTHVO_AUDIENCE=domain` | **a measurement, not pass/fail**: what the IAM issues for several `resource` parameters, in different orders, with an unlisted value, with a query, and (to measure only) one space-separated value (§7.4). The IAM version is printed from the running container |
 
 Every abort scenario also asserts the client stopped **before** registration and
 the device grant. If `evil.local.io` is not in `/etc/hosts` the runner maps it for
@@ -1072,8 +1091,9 @@ PRMs, and the service generates them per request.)
 | §5.4.7: refresh, re-sending the same `resource` | ⛔ not implemented (a MAY); the clients also do not request `offline_access` |
 | §5.4.3: if an authorization *response* carries an issuer (RFC 9207), it must match | ➖ not applicable: the device grant has no authorization response. The clients' `iss` check is a sanity check on the token's own claim (RFC 7519 §4.1.1), not RFC 9207 |
 | §3.3.1: the AS **publishes** `protected_resources` (also in the OIDC document, as a SHOULD) | ✅ via the augmenter, which adds it to both documents |
-| §3.3.1: the AS **SHOULD reject** a `resource` it does not list (RFC 8707 `invalid_target`) | ❌ INDIGO 1.10 does not: it issued the same token for a listed, an unlisted and an absent `resource` (checked) |
-| §3.3.1: the AS **SHOULD restrict the audience** to the requested resource | ❌ INDIGO 1.10 issues no `aud`; ✅ with the optional token exchange |
-| §5.4.5 / RFC 8707 §2: a domain-wide token by repeating `resource` | ✅ clients (`audience="domain"`); ➖ **measured on INDIGO 1.10.0**: both repeated values are accepted and ignored — no `aud`, claims identical to a token requested with one or no `resource` (§7.4, scenario 9). The "first value only" / space-separated behaviour of newer INDIGO releases was **not** exercised |
+| §3.3.1: the AS **SHOULD reject** a `resource` it does not list (RFC 8707 `invalid_target`) | ❌ INDIGO 1.10 does not: it issued the same token for a listed, an unlisted and an absent `resource` (checked). ❌ INDIGO 1.15.0 does not either: it issued a token with `aud` = the unlisted value (checked) |
+| §3.3.1: the AS **SHOULD restrict the audience** to the requested resource | ❌ INDIGO 1.10 issues no `aud`; ✅ INDIGO 1.15.0 sets `aud` from `resource` (first value only); ✅ with the optional token exchange |
+| §5.4.5 / RFC 8707 §2: a domain-wide token by repeating `resource` | ✅ clients (`audience="domain"`); ➖ **measured** (§7.4, scenario 9): INDIGO **1.10.0** accepts and ignores the repeated values (no `aud`); INDIGO **1.15.0** honours `resource` but takes only the **first** repeated value, so it does not issue a domain-wide token (a single space-separated value does, which RFC 8707 does not define) |
+| §3.3.1: the AS rejects a `resource` with a query (RFC 8707 §2 discourages it) | ✔ observed on INDIGO 1.15.0 (`invalid_target` at the consent page); 1.10.0 ignores it. Reason the audience never comes from the PRM `resource` |
 | RFC 9728 §3.3 / the draft: the service answers for variable paths | ✅ `fake-rs` generates the PRM per request, `404` outside its service path |
 | §3.3.1 note: the proxy "retrieves the server's live RFC 8414 metadata" | ➕ INDIGO 1.10 serves **no** RFC 8414 document (`404`); the augmenter derives one from its OIDC document (§6.2) |
