@@ -772,6 +772,63 @@ Every abort scenario also asserts the client stopped **before** registration and
 the device grant. If `evil.local.io` is not in `/etc/hosts` the runner maps it for
 the client processes only.
 
+### Try it by hand
+
+With the stack up (`./setup.sh`, §5; `iam.local.io` and `src.local.io` in `/etc/hosts`) you can walk through
+the new behaviour yourself. Run the commands from `test-integration/`; where a demo asks you to log in, use
+`vouser` / `vouser` on the IAM's page (`python -m pip install -r demo/requirements.txt` first if `requests` is missing).
+
+**1. Look at the discovery, no login.** The 401 points at a PRM derived from the URL you asked for, and the PRM
+generated for it names exactly that URL, query included:
+
+```bash
+curl -si --cacert certs/local-ca.pem 'https://src.local.io/vo/tap/async/42?ID=a%20b' | grep -i '^www-authenticate'
+curl -s  --cacert certs/local-ca.pem 'https://src.local.io/.well-known/oauth-protected-resource/vo/tap/async/42?ID=a%20b'
+curl -s  --cacert certs/local-ca.pem https://iam.local.io/.well-known/oauth-authorization-server \
+  | python3 -m json.tool | grep -A3 protected_resources      # two entries: …/vo and …/datalink
+curl -si --cacert certs/local-ca.pem https://src.local.io/.well-known/oauth-protected-resource/vocab | head -1   # not routed to this service: 404
+```
+
+**2. The guided demo** (pauses and explains every step, including why the PRM must name the exact URL and why the
+audience comes from the IAM's list):
+
+```bash
+cd demo
+python human_demo.py                       # defaults: https://src.local.io/vo/resource
+python human_demo.py --audience domain     # ask for every entry of the IAM's list
+java HumanDemo.java                        # the same walkthrough in Java
+```
+
+**3. A variable path and a query.** The prompt says the token is for `https://src.local.io/vo`, not for the URL:
+
+```bash
+python demo.py --cacert ../certs/local-ca.pem --client-id-file ../seed/client_id \
+  --resource 'https://src.local.io/vo/tap/async/abc123?ID=ivo%3A%2F%2Fx%2Fy'
+```
+
+**4. The refusals** (each aborts before any login):
+
+```bash
+python auto_demo.py --cacert ../certs/local-ca.pem --client-id-file ../seed/client_id \
+  --resource https://src.local.io/vo/faults/prm-covering/resource     # PRM covers but is not equal: Step 2
+python auto_demo.py --cacert ../certs/local-ca.pem --client-id-file ../seed/client_id \
+  --resource https://src.local.io/vo/faults/prm-redirect/resource     # the PRM URL redirects: refused
+```
+
+The evil server needs `evil.local.io` in `/etc/hosts`; then `--resource https://evil.local.io/vo/resource`
+aborts at Step 3 (the issuer does not list it).
+
+**5. The reference clients and the full automated set.**
+
+```bash
+AUTHVO_CLIENT_ID=$(cat seed/client_id) AUTHVO_AUDIENCE=domain REQUESTS_CA_BUNDLE=certs/local-ca.pem \
+  python ../authvo_client.py https://src.local.io/vo/resource
+python tests/run_scenarios.py --java-cp "$JACKSON"
+```
+
+With `AUTHVO_AUDIENCE=domain` against INDIGO 1.15 you should see a `NOTE` that the issuer narrowed the audience to the
+first entry: that is the measured INDIGO behaviour (§7.4), not a fault in the client.
+
 ---
 
 ## 11. Troubleshooting

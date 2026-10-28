@@ -40,6 +40,9 @@ python demo/demo.py \
   --client-id-file seed/client_id
 ```
 
+For a hands-on walkthrough of the per-request PRM, the exact match, the audience and the refusals, see
+"Try it by hand" in the top-level README §10.
+
 The demo prints the device-flow URL + code; log in and approve, and it prints
 `protected resource data`. Everything is covered in the top-level README, §10
 (drivers, the reference clients, offline tests, the live scenarios):
