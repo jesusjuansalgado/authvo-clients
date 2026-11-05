@@ -4,8 +4,29 @@
 # Generates TLS material + the IAM signing keystore, starts the stack, then
 # provisions the (otherwise empty) INDIGO IAM with a vo.read scope, login users
 # and the authvo-client. Re-running is safe.
+#
+#   ./setup.sh            the default "proxy" configuration: INDIGO IAM v1.15.0 plus the
+#                         metadata augmenter, which adds `protected_resources`
+#   ./setup.sh --native   the "native" configuration: an IAM built from the fork that publishes
+#                         `protected_resources` itself (docker-compose.fork.yml); the first run
+#                         COMPILES the IAM (several minutes). The fork adds no database migration,
+#                         so you can switch between the two on the same database.
 set -euo pipefail
 cd "$(dirname "$0")"
+
+NATIVE=0
+for a in "$@"; do
+  case "$a" in
+    --native) NATIVE=1 ;;
+    -h|--help) sed -n '2,13p' "$0"; exit 0 ;;
+    *) echo "unknown option: $a (see --help)" >&2; exit 2 ;;
+  esac
+done
+if [ "$NATIVE" = 1 ]; then
+  # An explicit COMPOSE_FILE also ignores a local docker-compose.override.yml, like the README advises.
+  export COMPOSE_FILE=docker-compose.yml:docker-compose.fork.yml
+  echo ">> native configuration: IAM built from the fork, no metadata augmenter"
+fi
 
 mkdir -p certs traefik/dynamic iam/keys
 
@@ -99,7 +120,9 @@ fi
 
 # --- 5. bring it up + provision --------------------------------------------
 echo ">> starting the stack"
-docker compose up -d --build
+# --remove-orphans: switching from the proxy configuration to the native one leaves the
+# augmenter container behind otherwise.
+docker compose up -d --build --remove-orphans
 if [ "$REISSUED_LEAF" = 1 ]; then
   # Traefik loads the certificate at start-up; make it pick up the re-issued one.
   docker compose up -d --force-recreate proxy
@@ -127,4 +150,5 @@ server, a missing protected_resources list, a PRM that does not cover the URL, a
 redirect on the PRM):
 
   python tests/run_scenarios.py --java-cp "$JACKSON"   # Jackson jars for the Java client
+                                                       # (add --iam native after ./setup.sh --native)
 MSG

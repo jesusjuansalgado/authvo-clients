@@ -67,6 +67,16 @@ harness runs on its own (the checks they share are in `demo/authvo_checks.py`).
 The real clients are `authvo_client.py` and `AuthVoClient.java` at the repo root;
 the scenario runner exercises those.
 
+## Two configurations
+
+- **proxy** (default, `./setup.sh`): the released INDIGO IAM v1.15.0 plus the metadata augmenter, which adds
+  `protected_resources` to the IAM's discovery documents.
+- **native** (`./setup.sh --native`): an IAM **built from a fork** that publishes `protected_resources` itself
+  (`docker-compose.fork.yml` + `iam-fork/Dockerfile`; the first run compiles the IAM, several minutes). No augmenter.
+  Run the scenarios with `python tests/run_scenarios.py --iam native`.
+
+Both are kept; see the top-level README §6.5 for the differences and the results.
+
 ## Why the resource check, not a shared origin
 
 The old design hosted the PRM on the IAM origin and had the client require the

@@ -42,7 +42,8 @@ obtaining a real token for it. The agreed direction — as revised by
 | Path | Role |
 |------|------|
 | `authvo_client.py` / `AuthVoClient.java` | The two reference clients — **identical behaviour**; change both together |
-| `test-integration/docker-compose.yml` | Whole stack behind Traefik |
+| `test-integration/docker-compose.yml` | Whole stack behind Traefik: the default **proxy** configuration (released IAM v1.15.0 + augmenter) |
+| `test-integration/docker-compose.fork.yml`, `iam-fork/Dockerfile` | The **native** configuration (`./setup.sh --native`, `run_scenarios.py --iam native`): an override that builds the IAM from the fork `jesusjuansalgado/iam` (branch `rfc9728-protected-resource-metadata`, pinned by commit) which publishes `protected_resources` itself, and does not start the augmenter. **Keep both configurations**: the proxy approach stays until INDIGO ships the feature, and the fork is what is being proposed upstream |
 | `test-integration/iam/iam.env` | INDIGO IAM config (the authorization server; **never modify INDIGO**) |
 | `test-integration/augmenter/` | **Metadata augmenter** (Python, stdlib): adds `protected_resources` to the IAM's `/.well-known/oauth-authorization-server` and `/openid-configuration`. An **interim emulation** — delete it (and its Traefik router) once INDIGO publishes the member |
 | `test-integration/augmenter/config/protected_resources.json` | Resource ids the augmenter publishes (read per request) |
@@ -67,6 +68,7 @@ obtaining a real token for it. The agreed direction — as revised by
   `protected_resources` (with its coverage rule) and `aud`-only-when-present are *deliberate
   AuthVO-profile departures* (README §15). Never use coverage for the PRM, never take the audience
   from the PRM `resource`, and RFC 9207 does not apply to the device grant.
+- Every change must keep **both** harness configurations working (`run_scenarios.py` and `run_scenarios.py --iam native`).
 - The two clients must stay behaviourally identical; the exact-match, coverage and
   resource-indicator rules are pinned for both (and for the demos' copies) by the shared vectors in
   `test-integration/tests/coverage_vectors.json` (`covered`, `most_specific`, `exact`, `indicator`;
@@ -77,7 +79,7 @@ obtaining a real token for it. The agreed direction — as revised by
 ```bash
 python -m unittest discover -s test-integration/tests -p "test_*.py"   # offline (needs requests, flask, pyjwt[crypto])
 # Java offline tests + the live scenarios: see README.md §10
-python test-integration/tests/run_scenarios.py --java-cp "$JACKSON"    # needs the stack up
+python test-integration/tests/run_scenarios.py --java-cp "$JACKSON"    # needs the stack up (add --iam native for the fork configuration)
 ```
 
 The scenarios: happy path, evil RS, `protected_resources` removed, PRM for another resource,
