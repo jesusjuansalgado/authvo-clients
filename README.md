@@ -510,6 +510,24 @@ refusals and variable paths all pass unchanged — **20 of 20 verdicts**. Differ
 * The fork also hosts RFC 9728 metadata for *external* resources at `/protected-resource-metadata/{id}` (the
   pre-RFC 9728 sidecar idea). This harness does not use it: the PRM comes from the resource server (§6.1).
 
+**The discovery documents, compared** (the RFC 8414 and OIDC documents fetched from each configuration and diffed):
+
+* **What a client uses is identical.** `issuer`, every endpoint, `jwks_uri` and the device authorization endpoint are
+  the same, and the two services' entries in `protected_resources` are the same. The only difference there is the IAM's
+  own base URL, which the native list also carries. In both configurations the RFC 8414 document and the OIDC document
+  are identical to each other (the augmenter derives the first from the second; the fork serves both).
+* **Other differences come from the newer IAM code the fork is based on, not from the AuthVO changes:** the native
+  documents no longer list the `implicit` grant, the `token` response type, the `none` signing algorithm or `RSA1_5`.
+  `scopes_supported` lacked `vo.read` in the native capture, taken from a database that had just been created, and still
+  lacked it after provisioning; the newer IAM may cache its discovery document, so the cause was **not established**.
+  Tokens requested with `vo.read` were issued, and the resource server accepted them, in the native scenario run.
+* **Freshness differs.** In the proxy configuration the augmenter caches the IAM's live metadata for about 60 seconds
+  (`AUGMENTER_CACHE_SECONDS`) and re-reads `protected_resources.json` on **every request**, so editing the list takes
+  effect at once with no restart. In the native configuration the IAM serves its own document directly, with
+  `Cache-Control: no-cache, no-store` (the proxy sends no `Cache-Control` header), but the list comes from the IAM's
+  **configuration** (`iam.protected-resources`), so changing it needs an IAM restart. Worth stating upstream when proposing
+  the feature.
+
 ---
 
 ## 7. INDIGO IAM — required configuration & provisioning
