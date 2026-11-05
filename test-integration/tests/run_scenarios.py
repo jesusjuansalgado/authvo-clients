@@ -17,12 +17,19 @@ Prerequisites
     python tests/run_scenarios.py --java-cp "$JACKSON"          # everything
     python tests/run_scenarios.py --only 2,3 --skip-java        # a subset
 
+Two configurations of the harness are supported (--iam):
+  proxy   (default) docker-compose.yml: INDIGO IAM v1.15.0 + the metadata augmenter, which adds
+          `protected_resources` to the IAM's discovery documents (the interim emulation)
+  native  docker-compose.yml:docker-compose.fork.yml: an IAM built from the fork that publishes the
+          RFC 8414 document and `protected_resources` itself; no augmenter. Scenario 3 (which edits the
+          augmenter's file) does not apply and is skipped.
+
 Scenarios
   0  preflight: the stack serves what the flow relies on (a PRM generated per request)
   1  happy path (preconfigured client), 1b with dynamic registration, 1c with the
      optional RFC 8693 token exchange switched on
   2  evil resource server (evil.local.io): abort at the resource check
-  3  `protected_resources` removed from the augmenter config: abort at the check
+  3  `protected_resources` removed from the augmenter config: abort at the check (--iam proxy only)
   4  PRM `resource` is a different resource: abort at step 2
   5  the PRM URL redirects: abort (redirects are never followed)
   6  resource server: token-validation, PRM and routing cases (unit tests)
@@ -81,19 +88,29 @@ results = []          # (scenario, client, ok, detail); ok is None for a measure
 #  the device-login approver (what a human would do in a browser)             #
 # --------------------------------------------------------------------------- #
 
+def csrf(session):
+    """The CSRF field for a form POST, as a one-item dict (empty if the IAM sets no token).
+
+    Newer INDIGO (develop after v1.15.0, which the "native" fork is built on) protects /login and the
+    device pages with Spring's cookie CSRF token: the XSRF-TOKEN cookie value must come back as `_csrf`
+    (a browser form does this). v1.15.0 does not require it; sending it is harmless there.
+    """
+    return {"_csrf": c.value} if (c := next((c for c in session.cookies if c.name == "XSRF-TOKEN"), None)) else {}
+
+
 def approve_device(user_code, username, password):
     """Log in at the IAM and approve the pending device authorization."""
     s = requests.Session()
     s.verify = str(CA)
     s.get(IAM + "/login")                                   # prime the session cookie
-    r = s.post(IAM + "/login", data={"username": username, "password": password},
+    r = s.post(IAM + "/login", data={"username": username, "password": password, **csrf(s)},
                allow_redirects=False)
     if r.status_code not in (301, 302) or "error" in (r.headers.get("Location") or ""):
         raise RuntimeError(f"approver: login failed for {username}: {r.status_code}")
-    s.post(IAM + "/device/verify", data={"user_code": user_code})
+    s.post(IAM + "/device/verify", data={"user_code": user_code, **csrf(s)})
     a = s.post(IAM + "/device/approve", data={"user_code": user_code,
                                               "user_oauth_approval": "true",
-                                              "authorize": "Authorize"})
+                                              "authorize": "Authorize", **csrf(s)})
     if a.status_code >= 400 or "denied" in a.text.lower():
         raise RuntimeError(f"approver: approval failed: {a.status_code}")
     print(f"    {DIM}[runner] approved device code {user_code} as {username}{RESET}")
@@ -292,7 +309,14 @@ def s0_preflight(args):
     checks.append(("resource: no PRM for a path the service does not own (404)", r.status_code == 404))
 
     sidecar = s.get(IAM + "/.well-known/oauth-protected-resource", allow_redirects=False)
-    checks.append(("IAM origin does not serve a PRM sidecar (404)", sidecar.status_code == 404))
+    if args.iam == "native":
+        # the fork publishes RFC 9728 metadata for the IAM's OWN APIs; that is not a PRM for the
+        # services in `protected_resources`, which still publish theirs (step 2)
+        own = sidecar.json() if sidecar.ok else {}
+        checks.append(("native IAM publishes its own PRM for the IAM's APIs (not used by the flow)",
+                       sidecar.status_code == 200 and own.get("resource", "").startswith(IAM)))
+    else:
+        checks.append(("IAM origin does not serve a PRM sidecar (404)", sidecar.status_code == 404))
 
     for path in ("/.well-known/oauth-authorization-server", "/.well-known/openid-configuration"):
         r = s.get(IAM + path, allow_redirects=False)
@@ -343,6 +367,11 @@ def s2_evil(args, clients, creds, cid):
 
 def s3_list_removed(args, clients, creds, cid):
     header("Scenario 3 - protected_resources removed from the augmenter config: aborts at the check")
+    if args.iam == "native":
+        print(f"{DIM}skipped (--iam native): there is no augmenter file to empty. The native IAM always publishes "
+              f"`protected_resources` (at least its own base URL), so an ABSENT list cannot be staged here; "
+              f"a listed-but-not-covering list is scenario 2.{RESET}")
+        return
     original = AUGMENTER_CFG.read_text()
     try:
         AUGMENTER_CFG.write_text("{}\n")
@@ -437,8 +466,8 @@ def probe_token(resources, creds, cid):
         v = requests.Session()
         v.verify = str(CA)
         v.get(IAM + "/login")
-        v.post(IAM + "/login", data={"username": creds[0], "password": creds[1]}, allow_redirects=False)
-        why = v.post(IAM + "/device/verify", data={"user_code": dev["user_code"]})
+        v.post(IAM + "/login", data={"username": creds[0], "password": creds[1], **csrf(v)}, allow_redirects=False)
+        why = v.post(IAM + "/device/verify", data={"user_code": dev["user_code"], **csrf(v)})
         return {"error": "approval refused", "detail": why.text[:240], "approver": str(e)}
     deadline = time.time() + 120
     while time.time() < deadline:
@@ -471,18 +500,25 @@ def s9_domain_audience(args, clients, creds, cid):
     print(f"{DIM}Not a pass/fail test. IAM image: {version}. The clients send resource={SERVICE} and "
           f"resource={DATALINK} (two parameters, RFC 8707 2) on the device authorization AND the token request.{RESET}")
 
+    # What `audience="domain"` should request: the covering entry first, then every other entry the IAM
+    # lists (the native IAM also lists ITSELF, so this is not always just two entries).
+    listed = requests.get(IAM + "/.well-known/oauth-authorization-server", verify=str(CA)).json() \
+        .get("protected_resources", [])
+    expected = [SERVICE] + [e for e in listed if e != SERVICE]
+    print(f"{DIM}the IAM lists {listed}; domain mode should request {expected}{RESET}")
+
     def measured(sc, cl, rc, out):
         prompts = re.findall(r"Token is for\s*:\s*(\S+)|^\s+:\s*(\S+)$", out, re.M)
         entries = [a or b for a, b in prompts]
         sent = re.search(r"polling token endpoint \(resource=\[?([^\n]*?)\]?\)", out)
         aud = re.search(r"access token aud=(\S.*)", out)
         opaque = "opaque" in out
-        sent_both = bool(sent) and SERVICE in sent.group(1) and DATALINK in sent.group(1)
+        sent_both = bool(sent) and all(e in sent.group(1) for e in expected)
         ok_flow = rc == 0 and "SUCCESS" in out
-        detail = (f"client sent both entries on the token request: {sent_both}; prompt listed {entries}; "
+        detail = (f"client sent every entry on the token request: {sent_both}; prompt listed {entries}; "
                   f"flow {'completed' if ok_flow else 'did NOT complete (rc=%s)' % rc}; "
                   f"{'aud=' + aud.group(1).split(' (informational')[0].strip() if aud else 'no aud in the access token' + (' (opaque)' if opaque else '')}")
-        record(sc, cl, None if (sent_both and entries == [SERVICE, DATALINK]) else False, detail)
+        record(sc, cl, None if (sent_both and entries == expected) else False, detail)
 
     run_each(clients, "9", RESOURCE_URL, approve=True, creds=creds, client_id=cid,
              check=measured, env_extra={"AUTHVO_AUDIENCE": "domain"})
@@ -534,6 +570,9 @@ def main():
     ap.add_argument("--only", help="comma-separated scenario numbers (default: all)")
     ap.add_argument("--java-cp", help="Jackson classpath for the Java client")
     ap.add_argument("--skip-java", action="store_true")
+    ap.add_argument("--iam", choices=("proxy", "native"), default="proxy",
+                    help="which harness configuration is running: proxy = IAM + metadata augmenter "
+                         "(default); native = the IAM fork that publishes protected_resources itself")
     ap.add_argument("--username", default="vouser")
     ap.add_argument("--password", default="vouser")
     args = ap.parse_args()

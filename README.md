@@ -206,7 +206,8 @@ enforces `aud`, at the entries it does not name.
 | `pom.xml` | Java build |
 | `Demo.java`, `demo.py` | Root-level copies of the simplest demo driver (`demo.py` just runs `test-integration/demo/demo.py`) |
 | `test-integration/` | The runnable Docker harness (everything below lives here) |
-| `test-integration/docker-compose.yml` | The whole stack behind Traefik |
+| `test-integration/docker-compose.yml` | The whole stack behind Traefik (the default, **proxy** configuration) |
+| `test-integration/docker-compose.fork.yml`, `iam-fork/Dockerfile` | The **native** configuration: an override that swaps in an IAM built from the fork that publishes `protected_resources` itself, and drops the augmenter (§6.5) |
 | `test-integration/setup.sh` | One-shot: certs + keystore + Traefik config, brings it up, provisions |
 | `test-integration/iam/iam.env` | INDIGO IAM configuration |
 | `test-integration/iam/GenKeystore.java` | Generates the IAM JWK signing keystore (pure JDK) |
@@ -420,6 +421,52 @@ would be obvious.
 
 ---
 
+### 6.5 The native configuration (IAM fork), next to the proxy approach
+
+The default harness uses the **proxy approach**: INDIGO IAM v1.15.0 plus the augmenter (§6.2), because
+the released IAM does not publish `protected_resources`. A second configuration, the **native** one,
+runs an IAM **built from a fork** that publishes it itself, so the clients can be checked against what
+is being proposed upstream. Both are kept: the proxy approach stays until INDIGO ships the feature.
+
+| | proxy (default) | native |
+|---|---|---|
+| IAM | `indigoiam/iam-login-service:v1.15.0` | `authvo/iam-fork:6e2225d`, built from [`jesusjuansalgado/iam`](https://github.com/jesusjuansalgado/iam), branch `rfc9728-protected-resource-metadata`, **pinned by commit** (`iam-fork/Dockerfile`) |
+| RFC 8414 document and `protected_resources` | the augmenter derives/adds them | the IAM serves them (also in the OIDC document) |
+| the list | `augmenter/config/protected_resources.json` | `iam.protected-resources` in the IAM's configuration (`IAM_PROTECTEDRESOURCES_<n>_ID` / `_RESOURCE` / `_SCOPES`, in `docker-compose.fork.yml`), **plus the IAM's own base URL**, which is always listed |
+| repeated `resource` | first value only becomes `aud` | **every** value becomes `aud` (RFC 8707) |
+| `resource` not listed, or with a query | unlisted: token issued; query: rejected at the consent page | `invalid_target` at the **device authorization request** for both (`IAM_RESOURCE_INDICATORS_RESTRICT_TO_PROTECTED_RESOURCES=true`) |
+| augmenter service | runs | not started (`profiles: [proxy-approach]`) |
+
+```bash
+cd test-integration
+./setup.sh --native            # first run compiles the IAM (Maven, several minutes), then provisions it
+python tests/run_scenarios.py --iam native --java-cp "$JACKSON"
+./setup.sh                     # back to the proxy approach (the fork adds no database migration)
+```
+
+`docker-compose.fork.yml` is an override: `COMPOSE_FILE=docker-compose.yml:docker-compose.fork.yml docker compose …`
+does the same by hand (an explicit `COMPOSE_FILE` also ignores a local `docker-compose.override.yml`). To try another
+fork commit or branch: `docker compose build --build-arg IAM_FORK_REF=<sha-or-branch> iam`.
+
+**What the clients do against it** (both clients, scenarios 0–9; the same offline tests): the happy paths, the
+refusals and variable paths all pass unchanged — **20 of 20 verdicts**. Differences worth knowing:
+
+* **`audience="domain"` works.** The token's `aud` names every entry, so there is no narrowing `NOTE`. The list
+  includes the IAM's **own** base URL (`https://iam.local.io`), because the fork publishes it in
+  `protected_resources`; a domain-wide token therefore also covers the IAM's own APIs unless the IAM is run with
+  `iam.resource-indicators.require-iam-audience` (which enforces the audience on its APIs). Worth raising upstream.
+* The scenario runner's **preflight** expects, instead of "no PRM on the IAM origin", the fork's own PRM for the IAM's
+  APIs (not used by the flow, which takes the PRM from the resource server); **scenario 3** (empty the augmenter's
+  list) is skipped: the native IAM always publishes at least its own URL, so an absent list cannot be staged
+  (a list that does not cover the URL is scenario 2).
+* **CSRF on the login pages.** The fork is built on upstream `develop`, whose `/login` and device pages require the
+  cookie CSRF token (`XSRF-TOKEN` cookie sent back as `_csrf`), as a browser does. The scripted approvers
+  (`tests/run_scenarios.py`, `demo/auto_demo.py`) send it; v1.15.0 does not require it and ignores it.
+* The fork also hosts RFC 9728 metadata for *external* resources at `/protected-resource-metadata/{id}` (the
+  pre-RFC 9728 sidecar idea). This harness does not use it: the PRM comes from the resource server (§6.1).
+
+---
+
 ## 7. INDIGO IAM — required configuration & provisioning
 
 A stock `indigoiam/iam-login-service:v1.15.0` started with the production-style
@@ -553,28 +600,30 @@ always checked.
 > and never fail on it. (Earlier versions of `human_demo` used INDIGO's non-standard `aud` request
 > parameter; that is gone — the clients send `resource` only.)
 
-> **Measured — several `resource` parameters** (scenario 9 in §10), on two INDIGO releases.
+> **Measured — several `resource` parameters** (scenario 9 in §10), on two INDIGO releases and on the fork of §6.5.
 > The clients, run with `AUTHVO_AUDIENCE=domain`, send `resource=https://src.local.io/vo` **and**
 > `resource=https://src.local.io/datalink` on the device authorization request and on every token
 > poll. Direct probes with the same user and client show what each IAM does with them:
 >
-> | `resource` sent | v1.10.0 | v1.15.0 |
-> |-----------------|---------|---------|
-> | none | no `aud` | no `aud` |
-> | one listed value | no `aud` (ignored) | `aud` = that value |
-> | `[service, datalink]` (the clients' order) | no `aud` | `aud` = **`service` only** |
-> | `[datalink, service]` (reversed) | no `aud` | `aud` = **`datalink` only** |
-> | `[service, datalink, unlisted]` | no `aud` | `aud` = `service` only |
-> | one value **not** in `protected_resources` | token issued, no `aud` | token issued, **`aud` = that unlisted value** (no `invalid_target`) |
-> | one value **with a query** | accepted, ignored | device authorization accepted, then the consent page fails with `invalid_target`: *"The resource indicator contains a query component"* — no token |
-> | **one space-separated value** `"service datalink"` (not RFC 8707; measured only, the clients never send it) | no `aud` | `aud` = **both**, as a list |
+> | `resource` sent | v1.10.0 | v1.15.0 | fork (native, §6.5) |
+> |-----------------|---------|---------|---------------------|
+> | none | no `aud` | no `aud` | no `aud` |
+> | one listed value | no `aud` (ignored) | `aud` = that value | `aud` = that value |
+> | `[service, datalink]` (the clients' order) | no `aud` | `aud` = **`service` only** | `aud` = **both** |
+> | `[datalink, service]` (reversed) | no `aud` | `aud` = **`datalink` only** | `aud` = both, in that order |
+> | `[service, datalink, unlisted]` | no `aud` | `aud` = `service` only | `invalid_target` (device authorization) |
+> | one value **not** in `protected_resources` | token issued, no `aud` | token issued, **`aud` = that unlisted value** (no `invalid_target`) | `invalid_target`: *"not a registered protected resource"* (with restriction on) |
+> | one value **with a query** | accepted, ignored | device authorization accepted, then the consent page fails with `invalid_target`: *"The resource indicator contains a query component"* — no token | `invalid_target` at the device authorization request — no token |
+> | **one space-separated value** `"service datalink"` (not RFC 8707; measured only, the clients never send it) | no `aud` | `aud` = **both**, as a list | `aud` = both, as a list |
 >
 > So **v1.10.0 ignores `resource`**, repeated or not, and issues no `aud`. **v1.15.0 honours it but uses only the
 > *first* repeated value** (the order decides which), so `audience="domain"` does **not** yield a domain-wide token from
 > INDIGO 1.15: the covering entry is sent first, so the token is audience-restricted to the covering entry, as
 > with `audience="covering"`. Only a single space-separated value gave a multi-entry `aud`; that is not what RFC 8707
 > specifies and the clients do not send it (a client option for IAMs that need it would be a separate decision).
-> Two more facts from the same probes: v1.15.0 does **not** reject an unlisted resource (the draft's "SHOULD
+> The **fork** (native configuration, §6.5) puts **every** repeated value in `aud`, so `audience="domain"` gives the domain-wide
+> token the draft describes, and it rejects an unlisted value or one with a query with `invalid_target` already at the device
+> authorization request. Two more facts from the same probes on the released IAMs: v1.15.0 does **not** reject an unlisted resource (the draft's "SHOULD
 > `invalid_target`"; the Step 3 check stays the only protection), and it **does** reject a resource carrying a query,
 > which is why the audience must never be taken from the PRM `resource`. Releases between 1.10 and 1.15 were not tested.
 >
@@ -752,7 +801,8 @@ java  -cp out2 DemoHelpersTest test-integration/tests/coverage_vectors.json
 login auto-approved:
 
 ```bash
-python test-integration/tests/run_scenarios.py --java-cp "$JACKSON"
+python test-integration/tests/run_scenarios.py --java-cp "$JACKSON"            # the default, proxy configuration
+python test-integration/tests/run_scenarios.py --iam native --java-cp "$JACKSON"  # after ./setup.sh --native (§6.5)
 ```
 
 | # | Scenario | Expected |
@@ -760,7 +810,7 @@ python test-integration/tests/run_scenarios.py --java-cp "$JACKSON"
 | 0 | preflight | a PRM generated per request (also for a query, byte for byte), `404` outside the service, the augmented metadata with both entries, no PRM sidecar |
 | 1 | happy path (1: preconfigured client, 1b: dynamic registration, 1c: with the optional token exchange on), Python and Java | protected payload returned (1c: the exchanged token carries `aud=https://src.local.io/vo`) |
 | 2 | evil resource server (`evil.local.io`) | abort at the resource check, before any login |
-| 3 | `protected_resources` removed from the augmenter config | abort at the resource check |
+| 3 | `protected_resources` removed from the augmenter config (`--iam proxy` only: the native IAM always publishes at least its own URL) | abort at the resource check |
 | 4 | PRM `resource` is a different resource | abort at step 2 |
 | 5 | the PRM URL redirects | abort — redirects are never followed |
 | 6 | resource server's token-validation, PRM and routing cases | unit tests pass |
@@ -818,7 +868,8 @@ python auto_demo.py --cacert ../certs/local-ca.pem --client-id-file ../seed/clie
 The evil server needs `evil.local.io` in `/etc/hosts`; then `--resource https://evil.local.io/vo/resource`
 aborts at Step 3 (the issuer does not list it).
 
-**5. The reference clients and the full automated set.**
+**5. The reference clients and the full automated set.** (To try the same against an IAM that publishes
+`protected_resources` itself, bring the stack up with `./setup.sh --native` and add `--iam native` to the runner; §6.5.)
 
 ```bash
 AUTHVO_CLIENT_ID=$(cat seed/client_id) AUTHVO_AUDIENCE=domain REQUESTS_CA_BUNDLE=certs/local-ca.pem \
@@ -1108,7 +1159,9 @@ When a future INDIGO release publishes `protected_resources` itself, you will se
 the IAM's **own** document (check it directly, bypassing the augmenter). Until then the
 augmenter is harmless to leave in place: **if the upstream document already contains the
 member it is passed through untouched** — native support wins. Once you have confirmed it,
-delete the augmenter service and the two routes; no client or resource server changes.
+delete the augmenter service and the two routes; no client or resource server changes. The native configuration (§6.5, an IAM
+built from a fork that publishes the member) is what that looks like in this harness; the proxy approach stays the default until
+such an IAM is released.
 
 ---
 
@@ -1159,10 +1212,10 @@ PRMs, and the service generates them per request.)
 | §5.4.6: the resource server validates signature, `iss`, scope, expiry, and `aud` when present | ✅ `fake-rs` |
 | §5.4.7: refresh, re-sending the same `resource` | ⛔ not implemented (a MAY); the clients also do not request `offline_access` |
 | §5.4.3: if an authorization *response* carries an issuer (RFC 9207), it must match | ➖ not applicable: the device grant has no authorization response. The clients' `iss` check is a sanity check on the token's own claim (RFC 7519 §4.1.1), not RFC 9207 |
-| §3.3.1: the AS **publishes** `protected_resources` (also in the OIDC document, as a SHOULD) | ✅ via the augmenter, which adds it to both documents |
-| §3.3.1: the AS **SHOULD reject** a `resource` it does not list (RFC 8707 `invalid_target`) | ❌ INDIGO 1.10 does not: it issued the same token for a listed, an unlisted and an absent `resource` (checked). ❌ INDIGO 1.15.0 does not either: it issued a token with `aud` = the unlisted value (checked) |
-| §3.3.1: the AS **SHOULD restrict the audience** to the requested resource | ❌ INDIGO 1.10 issues no `aud`; ✅ INDIGO 1.15.0 sets `aud` from `resource` (first value only); ✅ with the optional token exchange |
-| §5.4.5 / RFC 8707 §2: a domain-wide token by repeating `resource` | ✅ clients (`audience="domain"`); ➖ **measured** (§7.4, scenario 9): INDIGO **1.10.0** accepts and ignores the repeated values (no `aud`); INDIGO **1.15.0** honours `resource` but takes only the **first** repeated value, so it does not issue a domain-wide token (a single space-separated value does, which RFC 8707 does not define) |
+| §3.3.1: the AS **publishes** `protected_resources` (also in the OIDC document, as a SHOULD) | ✅ via the augmenter, which adds it to both documents; ✅ natively by the IAM fork (§6.5), in both documents |
+| §3.3.1: the AS **SHOULD reject** a `resource` it does not list (RFC 8707 `invalid_target`) | ✅ the IAM fork (§6.5) does, with `restrict-to-protected-resources`, at the device authorization request. ❌ INDIGO 1.10 does not: it issued the same token for a listed, an unlisted and an absent `resource` (checked). ❌ INDIGO 1.15.0 does not either: it issued a token with `aud` = the unlisted value (checked) |
+| §3.3.1: the AS **SHOULD restrict the audience** to the requested resource | ❌ INDIGO 1.10 issues no `aud`; ✅ INDIGO 1.15.0 sets `aud` from `resource` (first value only); ✅ the IAM fork sets it from every value; ✅ with the optional token exchange |
+| §5.4.5 / RFC 8707 §2: a domain-wide token by repeating `resource` | ✅ clients (`audience="domain"`); ➖ **measured** (§7.4, scenario 9): INDIGO **1.10.0** accepts and ignores the repeated values (no `aud`); INDIGO **1.15.0** honours `resource` but takes only the **first** repeated value, so it does not issue a domain-wide token (a single space-separated value does, which RFC 8707 does not define); the **IAM fork** (§6.5) puts every repeated value in `aud`: a domain-wide token (its own base URL is one of the entries) |
 | §3.3.1: the AS rejects a `resource` with a query (RFC 8707 §2 discourages it) | ✔ observed on INDIGO 1.15.0 (`invalid_target` at the consent page); 1.10.0 ignores it. Reason the audience never comes from the PRM `resource` |
 | RFC 9728 §3.3 / the draft: the service answers for variable paths | ✅ `fake-rs` generates the PRM per request, `404` outside its service path |
 | §3.3.1 note: the proxy "retrieves the server's live RFC 8414 metadata" | ➕ INDIGO 1.10 and 1.15 serve **no** RFC 8414 document (`404`; checked live); the augmenter derives one from its OIDC document (§6.2) |

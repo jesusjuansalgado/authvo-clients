@@ -33,18 +33,25 @@ DEVICE_GRANT = "urn:ietf:params:oauth:grant-type:device_code"
 def auto_approve(s, issuer, user, pw, user_code):
     """Log the user in and approve the pending device authorization."""
     base = issuer.rstrip("/")
+
+    def csrf():
+        # Newer INDIGO protects /login and the device pages with a cookie CSRF token: the XSRF-TOKEN
+        # cookie value must come back as `_csrf` (a browser form does). Harmless where it is not required.
+        c = next((c for c in s.cookies if c.name == "XSRF-TOKEN"), None)
+        return {"_csrf": c.value} if c else {}
+
     s.get(base + "/login")                       # prime session cookie
     r = s.post(base + "/login",
-               data={"username": user, "password": pw},
+               data={"username": user, "password": pw, **csrf()},
                allow_redirects=False)
     if r.status_code not in (301, 302) or "error" in (r.headers.get("Location") or ""):
         raise SystemExit(f"[approve] login failed for {user}: {r.status_code} {r.headers.get('Location')}")
     # /device/verify renders the consent page for this user_code
-    s.post(base + "/device/verify", data={"user_code": user_code})
+    s.post(base + "/device/verify", data={"user_code": user_code, **csrf()})
     # /device/approve grants it
     a = s.post(base + "/device/approve",
                data={"user_code": user_code, "user_oauth_approval": "true",
-                     "authorize": "Authorize"})
+                     "authorize": "Authorize", **csrf()})
     if a.status_code >= 400 or "denied" in a.text.lower():
         raise SystemExit(f"[approve] approval failed: {a.status_code}")
     print(f"[*] auto-approved device code as {user}")

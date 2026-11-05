@@ -1,0 +1,48 @@
+# The "native" configuration: the IAM is built from the INDIGO IAM fork that publishes the
+# RFC 8414 metadata and `protected_resources` ITSELF, so the metadata augmenter (the proxy
+# approach of docker-compose.yml) is not needed and is not started.
+#
+# Use it as an override on top of docker-compose.yml (the default, proxy configuration stays as is):
+#
+#   export COMPOSE_FILE=docker-compose.yml:docker-compose.fork.yml
+#   docker compose up -d --build        # the first build compiles the IAM: several minutes
+#   bash seed/provision.sh
+#   python tests/run_scenarios.py --iam native --java-cp "$JACKSON"
+#
+# (Or: ./setup.sh --native.)  Go back to the proxy approach with
+#   export COMPOSE_FILE=docker-compose.yml && docker compose up -d --build --remove-orphans
+#
+# Fork: https://github.com/jesusjuansalgado/iam (branch rfc9728-protected-resource-metadata),
+# pinned by commit in iam-fork/Dockerfile.
+services:
+  iam:
+    image: authvo/iam-fork:6e2225d
+    build:
+      context: ./iam-fork
+      args:
+        IAM_FORK_REF: 6e2225d712653b4d09b63f737fe2ee911216c0a1
+    environment:
+      # `iam.protected-resources` (Spring relaxed binding): the identifiers this IAM publishes in
+      # `protected_resources`, in addition to its own base URL. Same two entries the augmenter lists
+      # in the proxy configuration (augmenter/config/protected_resources.json).
+      IAM_PROTECTEDRESOURCES_0_ID: "vo"
+      IAM_PROTECTEDRESOURCES_0_RESOURCE: "https://src.local.io/vo"
+      IAM_PROTECTEDRESOURCES_0_SCOPES: "vo.read"
+      IAM_PROTECTEDRESOURCES_1_ID: "datalink"
+      IAM_PROTECTEDRESOURCES_1_RESOURCE: "https://src.local.io/datalink"
+      IAM_PROTECTEDRESOURCES_1_SCOPES: "vo.read"
+      # Reject a `resource` that is not one of the above (or the IAM itself) with invalid_target
+      # (RFC 8707 2), as the AuthVO draft asks authorization servers to do.
+      IAM_RESOURCE_INDICATORS_RESTRICT_TO_PROTECTED_RESOURCES: "true"
+
+  # Not needed: the IAM serves its own metadata. Putting it in a profile that is never enabled
+  # keeps it out of `up`; the base file is untouched.
+  augmenter:
+    profiles: ["proxy-approach"]
+
+  proxy:
+    # The base file also waits for the augmenter; here it does not run.
+    depends_on: !override
+      - iam
+      - resource
+      - evil
