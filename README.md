@@ -116,7 +116,7 @@ sequenceDiagram
     rect rgba(255, 152, 0, 0.16)
     Note over C,AS: STEP 3 - RESOURCE CHECK, before any login (the security crux)
     C->>AS: GET /.well-known/oauth-authorization-server (RFC 8414)
-    Note right of AS: the augmenter adds protected_resources<br/>(interim, until INDIGO publishes it)
+    Note right of AS: protected_resources comes from the augmenter<br/>(proxy configuration, interim) or from the IAM itself<br/>(native configuration, the IAM fork)
     AS-->>C: issuer, protected_resources, endpoints
     alt (a) issuer differs from the PRM's, or (b) protected_resources is absent or does not cover the URL
         Note over C: ABORT at step 3 - an evil service is stopped here,<br/>before the user is asked to log in
@@ -265,6 +265,51 @@ flowchart LR
   Traefik router) can simply be deleted once INDIGO publishes the member.
 * `iam.local.io`, `src.local.io` and `evil.local.io` all resolve to `127.0.0.1`
   (via `/etc/hosts`) and are served by the same Traefik instance on `:443`.
+
+### 4.1 The same harness with the patched IAM (native configuration)
+
+The diagram above is the default, **proxy** configuration. The **native** configuration (§6.5) replaces
+the released IAM *and* the augmenter by an IAM built from the
+[fork](https://github.com/jesusjuansalgado/iam/tree/rfc9728-protected-resource-metadata) that publishes the
+RFC 8414 document and `protected_resources` itself. Everything else is identical — the clients, the resource
+server with its per-request PRM, the evil server, Traefik, the scenarios:
+
+```mermaid
+flowchart LR
+    client(["client"])
+    proxy["Traefik proxy<br/>:443"]
+    client -->|TLS| proxy
+
+    subgraph iamOrigin["iam.local.io — the authorization server's origin"]
+        iam["INDIGO IAM built from the fork<br/>/.well-known/oauth-authorization-server<br/>/.well-known/openid-configuration<br/>both with protected_resources (native)<br/>/token · /devicecode · /jwk · DCR<br/>repeated resource → aud · invalid_target"]
+    end
+
+    subgraph srcOrigin["src.local.io"]
+        rs["resource server<br/>the protected data<br/>+ its OWN PRM (RFC 9728)"]
+    end
+
+    subgraph evilOrigin["evil.local.io"]
+        evil["evil resource server<br/>names the real IAM,<br/>not in protected_resources"]
+    end
+
+    proxy --> iam
+    proxy --> rs
+    proxy --> evil
+```
+
+What changes, in one place (details and results in §6.5):
+
+| | proxy configuration | native configuration |
+|---|---|---|
+| who publishes `protected_resources` | the **augmenter** (Python reverse proxy, interim) | the **IAM** itself, from `iam.protected-resources` |
+| Traefik routes on `iam.local.io` | the two metadata paths → augmenter (priority 100), the rest → IAM | everything → IAM |
+| what a client sees | identical metadata | identical metadata (plus the IAM's own base URL in the list) |
+| repeated `resource` | first value only becomes `aud` (INDIGO 1.15.0) | every value becomes `aud` |
+| `invalid_target` for an unlisted resource | never | yes, with `restrict-to-protected-resources` |
+| start it | `./setup.sh` | `./setup.sh --native` |
+
+This is the path to retire the augmenter (§14.5): once the fork's changes are in a released INDIGO, the native
+configuration becomes the default and the proxy one can go.
 
 ---
 
